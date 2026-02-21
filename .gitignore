@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Local/editor
+.DS_Store
+.env
+.venv/
+.python-version
+
+# LoopBench runtime artifacts
+runs/
+workspaces/
+caches/
+.tmp/
+experiments/
+
+# Conda/miniconda local installs
+.conda/
+.miniconda/

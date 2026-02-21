@@ -1,0 +1,18 @@
+experiment_id: dbcoord-demo-20260221
+tasks:
+  - .tmp/smoke_task
+lineups:
+  - name: codex-triad
+    planner_model: openai/gpt-5.2-codex
+    coder_a_model: openai/gpt-5.2-codex
+    coder_b_model: openai/gpt-5.2-codex
+    role_command: "/workspace/loopbench_project_spec/scripts/example_role_driver.sh"
+    role_env:
+      LOOPBENCH_AGENT_CMD: |
+        cat >"${LB_OUTPUT_JSON}" <<'JSON'
+        {"status":"completed","role":"${LB_ROLE}","phase":"${LB_PHASE}"}
+        JSON
+rollouts_per_task: 2
+max_parallel_rollouts: 2
+available_agent_sandboxes: 20
+runtime_config: configs/runtime.yaml

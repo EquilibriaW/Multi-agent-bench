@@ -1,0 +1,49 @@
+roles:
+  - name: planner_reviewer
+    model: openai/gpt-5.2-codex
+    max_tokens: 200000
+    driver: noop
+    command: ""
+    env: {}
+
+  - name: coder_a
+    model: openai/gpt-5.2-codex
+    max_tokens: 200000
+    driver: noop
+    command: ""
+    env: {}
+
+  - name: coder_b
+    model: openai/gpt-5.2-codex
+    max_tokens: 200000
+    driver: noop
+    command: ""
+    env: {}
+
+scheduling:
+  mode: phased
+  max_review_rounds: 3
+  phases:
+    - name: bootstrap
+      active_roles: [planner_reviewer]
+      exit_condition: plan_written
+
+    - name: implementation
+      active_roles: [coder_a, coder_b]
+      exit_condition: coders_done
+
+    - name: review
+      active_roles: [planner_reviewer, coder_a, coder_b]
+      exit_condition: public_validate_pass
+
+    - name: finalize
+      active_roles: [planner_reviewer]
+      exit_condition: final_patch_written
+
+budgets:
+  wall_clock_sec: 3600
+  tool_calls: 800
+  env_cycles: 30
+  log_queries: 200
+  metric_queries: 200
+  http_requests: 300

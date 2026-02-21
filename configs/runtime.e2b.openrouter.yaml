@@ -1,0 +1,32 @@
+sandbox_backend:
+  kind: e2b_firecracker
+  image: null
+  network: none
+  e2b:
+    template: null
+    timeout_sec: 3600
+    allow_internet_access: true
+    api_key_env: E2B_API_KEY
+
+env_runner:
+  kind: host_process
+  image: null
+  substrate_default: compose
+  observability:
+    logs: loki
+    metrics: prometheus
+    traces: none
+    logs_endpoint: null
+    metrics_endpoint: null
+    traces_endpoint: null
+
+judge:
+  kind: docker_container
+  image: ghcr.io/loopbench/judge:latest
+  network: none
+  docker_host: null
+
+storage:
+  workspace_root: workspaces
+  runs_root: runs
+  cache_root: caches

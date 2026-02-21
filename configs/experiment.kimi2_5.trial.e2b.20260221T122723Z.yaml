@@ -1,0 +1,20 @@
+experiment_id: kimi2_5-team-e2b-trial-2x3-20260221T122723Z
+tasks:
+  - .tmp/abc_out/task_jellyfangs_messenger_bot_tutorial__root
+  - .tmp/abc_out/task_maccman_go__link_management
+lineups:
+  - name: kimi2_5-team
+    planner_model: moonshotai/kimi-k2.5
+    coder_a_model: moonshotai/kimi-k2.5
+    coder_b_model: moonshotai/kimi-k2.5
+    role_command: "/workspace/loopbench_project_spec/scripts/openrouter_role_driver.py"
+    role_env:
+      OPENROUTER_API_KEY_ENV: OPEN_ROUTER_API_KEY
+      OPENROUTER_APP_TITLE: loopbench-team
+      OPENROUTER_HTTP_REFERER: https://localhost/loopbench
+      OPENROUTER_TEMPERATURE: "0.2"
+      OPENROUTER_MAX_TOKENS: "4096"
+rollouts_per_task: 3
+max_parallel_rollouts: 6
+available_agent_sandboxes: 20
+runtime_config: configs/runtime.e2b.openrouter.yaml
