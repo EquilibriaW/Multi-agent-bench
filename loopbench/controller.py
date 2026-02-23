@@ -236,6 +236,13 @@ def run_benchmark(
             workflow_summary_path=workflow_summary_path,
         )
         event_logger.log("run_finished", run_finished_payload)
+
+        try:
+            from .hodoscope_export import auto_analyze
+            auto_analyze(run_paths.run_dir)
+        except Exception:  # noqa: BLE001
+            pass
+
         return manifest
     except Exception as exc:  # noqa: BLE001
         trace_error = str(exc)

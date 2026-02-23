@@ -59,6 +59,18 @@ def build_parser() -> argparse.ArgumentParser:
     pre_p = sub.add_parser("preflight", help="run infra readiness checks")
     pre_p.add_argument("--config", default="configs/runtime.yaml")
 
+    insp_p = sub.add_parser("inspect", help="render run artifacts as a cohesive narrative")
+    insp_p.add_argument("run_dir", help="path to run directory (must contain manifest.json)")
+    insp_p.add_argument("--format", choices=["rich", "markdown"], default="rich", dest="output_format")
+    insp_p.add_argument("--diff-lines", type=int, default=60, help="max diff lines shown")
+
+    hodo_p = sub.add_parser("hodoscope", help="export trajectories and run hodoscope analysis")
+    hodo_p.add_argument("run_dirs", nargs="+", help="run directories to analyze")
+    hodo_p.add_argument("--viz", action="store_true", help="generate interactive HTML visualization")
+    hodo_p.add_argument("--out", default=None, help="output directory for analysis artifacts")
+    hodo_p.add_argument("--summarize-model", default=None, help="LLM model for action summarization")
+    hodo_p.add_argument("--embedding-model", default=None, help="model for embedding summaries")
+
     return parser
 
 
@@ -121,6 +133,26 @@ def main() -> None:
     if args.cmd == "preflight":
         runtime_cfg = load_runtime_config(args.config)
         result = run_preflight(runtime_cfg)
+        console.print(json.dumps(result, indent=2))
+        return
+
+    if args.cmd == "inspect":
+        from .inspect_run import run_inspect
+
+        run_inspect(run_dir=args.run_dir, output_format=args.output_format, diff_lines=args.diff_lines)
+        return
+
+    if args.cmd == "hodoscope":
+        from .hodoscope_export import export_and_analyze
+
+        result = export_and_analyze(
+            run_dirs=args.run_dirs,
+            out_dir=args.out,
+            viz=args.viz,
+            summarize_model=args.summarize_model,
+            embedding_model=args.embedding_model,
+        )
+        console.print("[green]hodoscope analysis complete[/green]")
         console.print(json.dumps(result, indent=2))
         return
 

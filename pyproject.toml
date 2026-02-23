@@ -9,6 +9,7 @@ dependencies = [
   "rich>=13.7",
   "e2b-code-interpreter>=1.0.0",
   "langsmith>=0.7",
+  "hodoscope>=0.1",
 ]
 
 [project.scripts]
@@ -22,6 +23,4 @@ build-backend = "setuptools.build_meta"
 include = ["loopbench*"]
 
 [tool.uv.workspace]
-members = [
-    "runs/.judge_workspaces/reflection-test-3x1-20260222T2200Z_kimi2_5-reflection_task_15dkatz_official_joke_api__filtered_joke_lookup_r01/repo",
-]
+members = []

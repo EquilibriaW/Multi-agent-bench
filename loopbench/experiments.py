@@ -420,15 +420,19 @@ def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
             pressure_index.append(r.review_iterations + r.merge_conflicts + r.env_cycles_used)
 
         # pass@1: first-attempt success rate per task (ABC bench compatible)
+        # Denominator excludes infra errors (our fault, not the agent's) but
+        # includes timeouts (agent exceeded resource allocation = legitimate failure).
         first_rollouts = [r for r in recs if r.rollout_index == 1]
-        pass_at_1_ok = sum(1 for r in first_rollouts if r.status == "ok")
+        pass_at_1_evaluable = sum(1 for r in first_rollouts if r.status != "infra_error")
         pass_at_1_passes = sum(1 for r in first_rollouts if r.status == "ok" and r.hidden_pass is True)
+        pass_at_1_infra = sum(1 for r in first_rollouts if r.status == "infra_error")
 
         summary[lineup] = {
             "n_rollouts": n,
             "n_evaluable": n_ok,
             "run_completion_rate": _ratio(n_ok, n),
-            "pass_at_1": _ratio(pass_at_1_passes, pass_at_1_ok),
+            "pass_at_1": _ratio(pass_at_1_passes, pass_at_1_evaluable),
+            "pass_at_1_infra_excluded": pass_at_1_infra,
             "hidden_pass_rate": _ratio(hidden_passes, n_ok),
             "public_pass_rate": _ratio(public_passes, n_ok),
             "median_wall_clock_sec": _median_or_none(wall),
