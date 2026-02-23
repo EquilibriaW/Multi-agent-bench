@@ -14,6 +14,7 @@ from typing import Any, Dict, Protocol
 
 from .config import RoleConfig
 from .interfaces import Sandbox
+from .path_utils import safe_path_component
 
 
 @dataclass
@@ -62,6 +63,7 @@ class ShellRoleDriver:
         env: Dict[str, str] | None = None,
         model: str | None = None,
         sandbox: Sandbox | None = None,
+        role_timeout_sec: int = 1800,
     ):
         if not command:
             raise ValueError("shell role driver requires a non-empty command")
@@ -71,6 +73,7 @@ class ShellRoleDriver:
         self.extra_env = env or {}
         self.model = model
         self.sandbox = sandbox
+        self.role_timeout_sec = max(60, min(int(role_timeout_sec), 7200))
 
     def run_phase(
         self,
@@ -86,7 +89,7 @@ class ShellRoleDriver:
         archive_dir.mkdir(parents=True, exist_ok=True)
 
         runtime_suffix_raw = context.get("runtime_suffix")
-        runtime_suffix = self._safe_suffix(runtime_suffix_raw if isinstance(runtime_suffix_raw, str) else None)
+        runtime_suffix = safe_path_component(runtime_suffix_raw if isinstance(runtime_suffix_raw, str) else None)
         stem = f"{role}_{phase}" if not runtime_suffix else f"{role}_{phase}_{runtime_suffix}"
 
         context_path = state_dir / f"{stem}_context.json"
@@ -117,24 +120,84 @@ class ShellRoleDriver:
         env.update(self.extra_env)
 
         sandbox_command = self._prepare_sandbox_command(worktree_path)
-        sandbox_result = self.sandbox.exec(
-            ["bash", "-lc", sandbox_command],
-            cwd=str(worktree_path),
-            timeout_sec=3600,
-            env=env,
-        )
-        ok = sandbox_result.ok
-        stdout = sandbox_result.stdout
-        stderr = sandbox_result.stderr
-        exit_code = int(sandbox_result.exit_code) if sandbox_result.exit_code is not None else 1
-
         parsed_output: Dict[str, Any] = {}
+        try:
+            sandbox_result = self.sandbox.exec(
+                ["bash", "-lc", sandbox_command],
+                cwd=str(worktree_path),
+                timeout_sec=self.role_timeout_sec,
+                env=env,
+            )
+            ok = sandbox_result.ok
+            stdout = sandbox_result.stdout
+            stderr = sandbox_result.stderr
+            exit_code = int(sandbox_result.exit_code) if sandbox_result.exit_code is not None else 1
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            stdout = ""
+            stderr = str(exc)
+            exit_code = 1
+            parsed_output = {
+                "status": "error",
+                "error": str(exc),
+                "role": role,
+                "phase": phase,
+            }
+            try:
+                output_path.write_text(json.dumps(parsed_output, indent=2), encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
+
         if output_path.exists():
             try:
-                parsed_output = json.loads(output_path.read_text(encoding="utf-8"))
+                raw_output = json.loads(output_path.read_text(encoding="utf-8"))
+                if isinstance(raw_output, dict):
+                    parsed_output = raw_output
+                else:
+                    parsed_output = {
+                        "status": "error",
+                        "error": (
+                            "invalid output json: expected object at root, "
+                            f"got {type(raw_output).__name__}"
+                        ),
+                        "role": role,
+                        "phase": phase,
+                    }
+                    ok = False
+                    if exit_code == 0:
+                        exit_code = 1
+                    if stderr:
+                        stderr = (
+                            f"{stderr}\n"
+                            f"invalid output json: expected object at root, got {type(raw_output).__name__}"
+                        )
+                    else:
+                        stderr = (
+                            "invalid output json: expected object at root, "
+                            f"got {type(raw_output).__name__}"
+                        )
             except json.JSONDecodeError as exc:
-                parsed_output = {"error": f"invalid output json: {exc}"}
+                parsed_output = {
+                    "status": "error",
+                    "error": f"invalid output json: {exc}",
+                    "role": role,
+                    "phase": phase,
+                }
+                ok = False
+                if exit_code == 0:
+                    exit_code = 1
+                decode_msg = f"invalid output json: {exc}"
+                if stderr:
+                    stderr = f"{stderr}\n{decode_msg}"
+                else:
+                    stderr = decode_msg
         self._archive_runtime_outputs(state_dir=state_dir, archive_dir=archive_dir, stem=stem)
+        self._attach_runtime_artifact_paths(
+            parsed_output=parsed_output,
+            run_dir=run_dir,
+            archive_dir=archive_dir,
+            stem=stem,
+        )
 
         return RoleRunResult(
             ok=ok,
@@ -150,6 +213,45 @@ class ShellRoleDriver:
             if not path.is_file():
                 continue
             shutil.copy2(path, archive_dir / path.name)
+
+    def _attach_runtime_artifact_paths(
+        self,
+        *,
+        parsed_output: Dict[str, Any],
+        run_dir: Path,
+        archive_dir: Path,
+        stem: str,
+    ) -> None:
+        paths: Dict[str, str] = {}
+        names = [
+            f"{stem}_context.json",
+            f"{stem}_output.json",
+            f"{stem}_openrouter_request.json",
+            f"{stem}_openrouter_response.txt",
+            f"{stem}_openrouter_attempts.json",
+            f"{stem}_command_trace.json",
+        ]
+
+        run_root = run_dir.resolve()
+        for name in names:
+            path = archive_dir / name
+            if not path.is_file():
+                continue
+            try:
+                rel = path.resolve().relative_to(run_root)
+                paths[name] = str(rel)
+            except Exception:  # noqa: BLE001
+                paths[name] = str(path)
+
+        if not paths:
+            return
+
+        existing = parsed_output.get("artifact_paths")
+        if isinstance(existing, dict):
+            existing.update(paths)
+            parsed_output["artifact_paths"] = existing
+            return
+        parsed_output["artifact_paths"] = paths
 
     def _prepare_sandbox_command(self, worktree_path: Path) -> str:
         parts = shlex.split(self.command)
@@ -168,26 +270,20 @@ class ShellRoleDriver:
 
         return self.command
 
-    def _safe_suffix(self, raw: str | None) -> str:
-        if not raw:
-            return ""
-        chars = []
-        for ch in raw:
-            if ch.isalnum() or ch in {"-", "_", "."}:
-                chars.append(ch)
-            else:
-                chars.append("_")
-        return "".join(chars)[:120]
-
-
 def build_role_driver(role_cfg: RoleConfig, *, sandbox: Sandbox | None = None) -> RoleDriver:
     if role_cfg.driver == "noop":
         return NoopRoleDriver()
     if role_cfg.driver == "shell":
+        timeout_raw = role_cfg.env.get("LOOPBENCH_ROLE_TIMEOUT_SEC")
+        try:
+            role_timeout_sec = int(timeout_raw) if timeout_raw is not None else 1800
+        except ValueError:
+            role_timeout_sec = 1800
         return ShellRoleDriver(
             command=role_cfg.command or "",
             env=role_cfg.env,
             model=role_cfg.model,
             sandbox=sandbox,
+            role_timeout_sec=role_timeout_sec,
         )
     raise ValueError(f"Unsupported role driver: {role_cfg.driver}")

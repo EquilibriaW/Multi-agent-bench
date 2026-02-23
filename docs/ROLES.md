@@ -51,11 +51,25 @@ Prompt policy:
 ### Phase 2 — Review & iteration (planner_reviewer ↔ coders)
 Planner/reviewer:
 - reviews diffs
+- runs dynamic checks (`run_commands`) during review
+- explicitly nominates which coder commits are eligible to merge
 - requests changes
 - optionally writes public regression tests
 - repeats until:
-  - public validation passes
+  - public validation policy is satisfied (`required`) or advisory checks are exhausted (`advisory`/`off`)
   - merge candidate is coherent
+
+Harness enforcement:
+- merge only includes commits listed by planner/reviewer nomination (`merge_commits`), not all unseen coder commits.
+- planner/reviewer can force rework even when public validation passes (`request_rework=true` + `coder_feedback`).
+- planner/reviewer output in review must include structured `merge_commits` (role -> commit list) and `request_rework`.
+- planner/reviewer review context includes coder commit candidates (`coder_commits`, `candidate_merge_commits`) and recent coder outputs to support explicit merge decisions.
+- planner/reviewer also receives a diff-inspection command (`review_diff_tool`) to list commits and view full patch content by coder + commit sha.
+- after nominated merges are materialized, planner/reviewer runs a `review_verify` phase on the integrated candidate and can request rework.
+- a review round is only acceptance-eligible when it is actionable:
+  - nominates at least one coder commit for merge, or
+  - requests coder rework, or
+  - applies planner-owned direct edits with rationale.
 
 ### Phase 3 — Finalization (planner_reviewer)
 Outputs:

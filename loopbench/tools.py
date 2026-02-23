@@ -6,6 +6,7 @@ ToolRouter implementation with budget checks and structured event logging.
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any, Dict, List
 
 from .budget import BudgetTracker
@@ -13,6 +14,7 @@ from .events import EventLogger
 from .interfaces import ToolRouter
 from .sandbox import LocalSandbox
 from .schema import Budget, ToolCall, ToolResult
+from .shell import run_command
 from .substrate import LocalSubstrate
 from .time_utils import now_ms
 
@@ -39,13 +41,14 @@ class DefaultToolRouter(ToolRouter):
             self.event_logger.log("tool_denied", {"call": call.model_dump(), "result": result.model_dump()})
             return result
 
-        self.budget.consume(call.tool)
         self.event_logger.log("tool_call", call.model_dump())
 
         try:
             result = self._dispatch(call)
         except Exception as exc:  # noqa: BLE001
             result = self._error(tool=call.tool, stderr=str(exc), exit_code=1)
+        finally:
+            self.budget.consume(call.tool)
 
         self.event_logger.log("tool_result", result.model_dump())
         return result
@@ -95,6 +98,8 @@ class DefaultToolRouter(ToolRouter):
 
         if tool == "repo.apply_patch":
             patch_text = str(args["patch_text"])
+            if patch_text and not patch_text.endswith("\n"):
+                patch_text = f"{patch_text}\n"
             sandbox.apply_patch(patch_text)
             return self._ok(tool=tool, data={"bytes": len(patch_text.encode("utf-8"))})
 
@@ -110,13 +115,7 @@ class DefaultToolRouter(ToolRouter):
 
         if tool == "repo.git_add_commit":
             message = str(args.get("message") or "loopbench commit")
-            add_paths = args.get("add_paths") or ["-A"]
-            add_cmd = ["git", "add", "-A"] if add_paths == ["-A"] else ["git", "add", *[str(p) for p in add_paths]]
-            add_result = sandbox.exec(add_cmd, timeout_sec=30)
-            if not add_result.ok:
-                return self._with_tool(add_result, tool)
-            commit_result = sandbox.exec(["git", "commit", "-m", message], timeout_sec=30)
-            return self._with_tool(commit_result, tool)
+            return self._with_tool(self._git_add_commit_local(sandbox=sandbox, message=message), tool)
 
         if tool == "repo.git_log":
             limit = int(args.get("limit", 20))
@@ -222,3 +221,48 @@ class DefaultToolRouter(ToolRouter):
     def _with_tool(self, result: ToolResult, tool: str) -> ToolResult:
         result.tool = tool
         return result
+
+    def _git_add_commit_local(self, *, sandbox: LocalSandbox, message: str) -> ToolResult:
+        quoted_message = shlex.quote(message)
+        commit_script = (
+            "set -euo pipefail\n"
+            "if ! git status --porcelain | grep -q .; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "git add -A\n"
+            "git reset -q HEAD -- .loopbench || true\n"
+            "staged_before=\"$(git diff --cached --name-only)\"\n"
+            "if [ -z \"$staged_before\" ]; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "while IFS= read -r staged_path; do\n"
+            "  [ -n \"$staged_path\" ] || continue\n"
+            "  case \"$staged_path\" in\n"
+            "    *.orig|*.rej|*.pyc|.coverage|.coverage.*|"
+            "__pycache__|__pycache__/*|*/__pycache__/*|"
+            ".pytest_cache|.pytest_cache/*|*/.pytest_cache/*|"
+            ".mypy_cache|.mypy_cache/*|*/.mypy_cache/*|"
+            ".ruff_cache|.ruff_cache/*|*/.ruff_cache/*|"
+            ".hypothesis|.hypothesis/*|*/.hypothesis/*)\n"
+            "      git reset -q HEAD -- \"$staged_path\" || true\n"
+            "      ;;\n"
+            "  esac\n"
+            "done <<EOF\n"
+            "$staged_before\n"
+            "EOF\n"
+            "if ! git diff --cached --name-only | grep -q .; then\n"
+            "  exit 0\n"
+            "fi\n"
+            f"git commit -m {quoted_message} >/dev/null\n"
+            "git rev-parse HEAD\n"
+        )
+        result = run_command(["bash", "-lc", commit_script], cwd=sandbox.root, timeout_sec=90)
+        return ToolResult(
+            ts_ms=now_ms(),
+            ok=result.ok,
+            tool="repo.git_add_commit",
+            stdout=result.stdout,
+            stderr=result.stderr,
+            exit_code=result.exit_code,
+            data={"cwd": str(sandbox.root), "elapsed_sec": result.elapsed_sec},
+        )

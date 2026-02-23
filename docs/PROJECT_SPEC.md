@@ -111,7 +111,7 @@ Each role operates in a separate worktree:
 The planner role can:
 - cherry-pick commits from coder worktrees
 - request coders to rebase/amend
-- run public validation on merge candidate
+- run public validation on merge candidate when policy is `advisory` or `required`
 
 ### 4.3 Required artifacts
 For every run, the harness must persist:

@@ -25,8 +25,9 @@ Assume the agent can:
 - default no-network for agent sandbox
 - judge may require Docker runtime for hidden tests; this privilege is granted to
   the judge runtime only, never to agent sandboxes.
-- for nested hosts, prefer a dedicated remote judge Docker endpoint (`judge.docker_host`)
-  so model outcomes are not confounded by local daemon instability.
+- for nested hosts, prefer dedicated remote Docker endpoints
+  (`env_runner.docker_host`, `judge.docker_host`) so model outcomes are not
+  confounded by local daemon instability.
 
 ### 2.3 Deterministic tool routing
 - if a capability is needed, expose it as a tool (http/logs/metrics)

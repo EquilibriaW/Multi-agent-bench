@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Set
 
 from .agents import RoleRunResult
+from .path_utils import safe_path_component
+from .review_logic import PublicValidationRecord, ReviewDecision
 
 
 class RunArtifacts:
@@ -39,7 +41,7 @@ class RunArtifacts:
         suffix: Optional[str] = None,
     ) -> None:
         safe_phase = phase.replace("/", "_")
-        safe_suffix = self._safe_suffix(suffix)
+        safe_suffix = safe_path_component(suffix)
         stem = f"{role}_{safe_phase}" if not safe_suffix else f"{role}_{safe_phase}_{safe_suffix}"
         filename = f"{stem}.md"
         summary_path = self.run_dir / "role_summaries" / filename
@@ -82,13 +84,113 @@ class RunArtifacts:
             return ""
         return path.read_text(encoding="utf-8")
 
-    def _safe_suffix(self, raw: Optional[str]) -> str:
-        if not raw:
-            return ""
-        chars = []
-        for ch in raw:
-            if ch.isalnum() or ch in {"-", "_", "."}:
-                chars.append(ch)
-            else:
-                chars.append("_")
-        return "".join(chars)[:120]
+    def write_review_round_audit(
+        self,
+        *,
+        planner: str,
+        round_index: int,
+        review_output: Dict[str, Any],
+        verify_output: Dict[str, Any],
+        decision: ReviewDecision,
+        inspected_commits_by_role: Dict[str, Set[str]],
+        merged_commits_this_round: Dict[str, List[str]],
+        merge_ok: bool,
+        public_validation: PublicValidationRecord,
+        accepted: bool,
+        force_rework: bool,
+    ) -> Path:
+        out_path = self.run_dir / "artifacts" / "review_audit" / f"round_{round_index}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        review_trace_path = self.run_dir / "role_runtime" / f"{planner}_review_round_{round_index}_command_trace.json"
+        verify_trace_path = self.run_dir / "role_runtime" / (
+            f"{planner}_review_verify_round_{round_index}_verify_command_trace.json"
+        )
+        payload = {
+            "round_index": round_index,
+            "accepted": bool(accepted),
+            "force_rework": bool(force_rework),
+            "request_rework": bool(decision.request_rework),
+            "merge_ok": bool(merge_ok),
+            "merge_commits_by_role": {role: list(commits) for role, commits in decision.merge_commits_by_role.items()},
+            "invalid_merge_roles": list(decision.invalid_merge_roles),
+            "uninspected_nominated_commits_by_role": {
+                role: list(commits) for role, commits in decision.uninspected_nominated_commits_by_role.items()
+            },
+            "inspected_commits_by_role": {role: sorted(commits) for role, commits in inspected_commits_by_role.items()},
+            "merged_commits_this_round": {role: list(commits) for role, commits in merged_commits_this_round.items()},
+            "review_dynamic_checks_ran": bool(decision.dynamic_checks_ran),
+            "public_validation": {
+                "ok": bool(public_validation.ok),
+                "noop": bool(public_validation.noop),
+                "state": public_validation.state.value,
+                "policy": public_validation.policy,
+                "stdout_tail": public_validation.stdout[-3000:],
+                "stderr_tail": public_validation.stderr[-3000:],
+            },
+            "review_command_trace_path": str(review_trace_path) if review_trace_path.exists() else None,
+            "verify_command_trace_path": str(verify_trace_path) if verify_trace_path.exists() else None,
+            "review_summary": str(review_output.get("summary") or ""),
+            "review_notes": str(review_output.get("notes") or ""),
+            "verify_summary": str(verify_output.get("summary") or ""),
+            "verify_notes": str(verify_output.get("notes") or ""),
+            "review_commands_run": review_output.get("commands_run"),
+            "verify_commands_run": verify_output.get("commands_run"),
+        }
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out_path
+
+    def write_workflow_summary(
+        self,
+        *,
+        task_id: str,
+        planner_role: str,
+        coder_roles: List[str],
+        coordination_db_path: str,
+        plan_path: str,
+        subtasks_path: str,
+        review_rounds_executed: int,
+        public_validate_policy: str,
+        public_validation_attempts: int,
+        public_validation_noop_rounds: int,
+        merge_conflicts: int,
+        merged_commits: Dict[str, Set[str]],
+        role_outputs: Dict[str, Dict[str, Any]],
+        coordination_summary: Dict[str, int],
+        public_pass: bool,
+        final_patch_path: str,
+    ) -> Path:
+        planner_mutations: Dict[str, List[str]] = {}
+        for key, output in role_outputs.items():
+            if not key.startswith(f"{planner_role}:") or not isinstance(output, dict):
+                continue
+            applied_paths = output.get("applied_paths")
+            if not isinstance(applied_paths, list):
+                continue
+            clean_paths = [str(p) for p in applied_paths if isinstance(p, str)]
+            if clean_paths:
+                planner_mutations[key] = clean_paths
+
+        out_path = self.run_dir / "artifacts" / "workflow_summary.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "task_id": task_id,
+            "planner_role": planner_role,
+            "coder_roles": list(coder_roles),
+            "coordination_db_path": coordination_db_path,
+            "plan_path": plan_path,
+            "subtasks_path": subtasks_path,
+            "review_rounds_executed": review_rounds_executed,
+            "public_validate_policy": public_validate_policy,
+            "public_validation_attempts": public_validation_attempts,
+            "public_validation_noop_rounds": public_validation_noop_rounds,
+            "merge_conflicts": merge_conflicts,
+            "merged_commits": {role: sorted(commits) for role, commits in merged_commits.items()},
+            "planner_mutations": planner_mutations,
+            "planner_mutation_count": sum(len(paths) for paths in planner_mutations.values()),
+            "coordination_summary": dict(coordination_summary),
+            "public_pass": bool(public_pass),
+            "final_patch_path": final_patch_path,
+        }
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return out_path

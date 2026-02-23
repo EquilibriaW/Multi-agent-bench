@@ -23,6 +23,7 @@ substrate:
   up_cmd: "make up"
   down_cmd: "make down"
   public_validate_cmd: "make public-validate"
+  public_validate_policy: "advisory"   # off | advisory | required
 
 feedback_surfaces:
   logs: true
@@ -40,6 +41,11 @@ budgets:
   log_queries: 200
   metric_queries: 200
 ```
+
+`public_validate_policy` behavior:
+- `off`: do not run `env.public_validate` during review rounds.
+- `advisory`: run if configured; failures/no-ops are feedback only (hidden judge still scores).
+- `required`: run if configured and require a passing non-noop result before accepting a round.
 
 ## 2) Public vs hidden assets
 
@@ -61,6 +67,7 @@ Adapter strategy:
 - expose only minimal smoke tests (public)
 - keep external API verification in `hidden/validate.sh`
 - map ABC-Bench’s docker compose assets into `public/workloads/` or `public/env/`
+- when no public smoke exists, set `public_validate_policy: off` and omit `public_validate_cmd`
 
 ### 3.2 DevOps-Gym adapter
 DevOps-Gym tasks cover:

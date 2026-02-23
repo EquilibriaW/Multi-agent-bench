@@ -59,8 +59,11 @@ scripts/with_local_docker.sh python -m loopbench.cli preflight --config configs/
 
 - `configs/runtime.e2b.openrouter.yaml`
   - keep `sandbox_backend.kind: e2b_firecracker`
-  - for local host Docker: `judge.docker_host: null`
-  - for remote Docker judge: `judge.docker_host: ssh://<user>@<host>`
+  - for local host Docker: `env_runner.docker_host: null` and `judge.docker_host: null`
+  - keep `env_runner.buildx_config` + `judge.buildx_config` set to a writable path
+    (default: `.loopbench/docker_buildx`) to avoid Docker buildx permission errors
+  - for remote Docker endpoint (both substrate + judge): set both to `ssh://<user>@<host>`
+  - optional split endpoints: set `env_runner.docker_host` and `judge.docker_host` independently
 
 ## 6) Export required secrets
 
@@ -77,6 +80,7 @@ python -m loopbench.cli preflight --config configs/runtime.e2b.openrouter.yaml
 
 Must be true:
 - `ok: true`
+- `env_runner_docker_daemon_ready: true`
 - `judge_docker_daemon_ready: true`
 - `e2b_api_key_present: true`
 - `e2b_python_sdk: true`
@@ -93,4 +97,3 @@ python -m loopbench.cli experiment \
 - Infra failures are tracked separately with `hidden_infra_error` in run manifest.
 - Do not compare pass-rates from runs that failed preflight.
 - Keep task packs immutable across machines to preserve comparability.
-

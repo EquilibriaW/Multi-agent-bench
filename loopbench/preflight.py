@@ -10,7 +10,7 @@ import shutil
 from typing import Any, Dict
 
 from .config import RuntimeConfig
-from .docker_runtime import docker_info, judge_docker_env
+from .docker_runtime import docker_info, env_runner_docker_env, judge_docker_env
 
 
 def run_preflight(runtime_cfg: RuntimeConfig) -> Dict[str, Any]:
@@ -37,6 +37,7 @@ def run_preflight(runtime_cfg: RuntimeConfig) -> Dict[str, Any]:
     obs = runtime_cfg.env_runner.observability
     checks["observability_logs_backend"] = obs.logs
     checks["observability_metrics_backend"] = obs.metrics
+    checks["observability_traces_backend"] = obs.traces
     if obs.logs.lower() == "loki":
         checks["observability_logs_endpoint_configured"] = bool(obs.logs_endpoint)
         if not obs.logs_endpoint:
@@ -53,24 +54,57 @@ def run_preflight(runtime_cfg: RuntimeConfig) -> Dict[str, Any]:
     else:
         checks["observability_metrics_endpoint_configured"] = None
 
+    if obs.traces.lower() == "langsmith":
+        checks["observability_traces_endpoint_configured"] = bool(obs.traces_endpoint)
+        checks["langsmith_sdk"] = _python_module_exists("langsmith")
+        checks["langsmith_api_key_present"] = bool(
+            (os.environ.get("LANGSMITH_API_KEY") or "").strip()
+            or (os.environ.get("LANGCHAIN_API_KEY") or "").strip()
+        )
+        if not checks["langsmith_sdk"]:
+            warnings.append("observability.traces=langsmith but python package 'langsmith' is not installed.")
+        if not checks["langsmith_api_key_present"]:
+            warnings.append(
+                "observability.traces=langsmith but LANGSMITH_API_KEY (or LANGCHAIN_API_KEY) is missing."
+            )
+    else:
+        checks["observability_traces_endpoint_configured"] = None
+        checks["langsmith_sdk"] = None
+        checks["langsmith_api_key_present"] = None
+
     ok = all(
         value is True
         for key, value in checks.items()
         if key in {"python", "git"}
     )
 
+    if obs.traces.lower() == "langsmith":
+        ok = ok and checks["langsmith_sdk"] is True and checks["langsmith_api_key_present"] is True
+
     if runtime_cfg.env_runner.substrate_default == "compose":
-        ok = ok and checks["docker"] is True
+        checks["env_runner_requires_docker"] = True
+        runner_env = env_runner_docker_env(runtime_cfg.env_runner, runtime_cfg.judge)
+        checks["env_runner_docker_host"] = runner_env.get("DOCKER_HOST")
+        checks["env_runner_buildx_config"] = runner_env.get("BUILDX_CONFIG")
+        checks["env_runner_docker_daemon_ready"] = _docker_daemon_ready(runner_env)
+        ok = ok and checks["docker"] is True and checks["env_runner_docker_daemon_ready"] is True
+    else:
+        checks["env_runner_requires_docker"] = False
+        checks["env_runner_docker_host"] = None
+        checks["env_runner_buildx_config"] = None
+        checks["env_runner_docker_daemon_ready"] = None
 
     if runtime_cfg.judge.kind == "docker_container":
         checks["judge_requires_docker"] = True
         judge_env = judge_docker_env(runtime_cfg.judge)
         checks["judge_docker_host"] = judge_env.get("DOCKER_HOST")
+        checks["judge_buildx_config"] = judge_env.get("BUILDX_CONFIG")
         checks["judge_docker_daemon_ready"] = _docker_daemon_ready(judge_env)
         ok = ok and checks["docker"] is True and checks["judge_docker_daemon_ready"] is True
     else:
         checks["judge_requires_docker"] = False
         checks["judge_docker_host"] = None
+        checks["judge_buildx_config"] = None
         checks["judge_docker_daemon_ready"] = None
 
     if sandbox_kind == "e2b_firecracker":

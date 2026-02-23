@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
+import time
 from typing import Dict, List, Optional
 
 from .path_utils import resolve_within_root
@@ -32,6 +33,11 @@ class E2BFirecrackerSandbox:
         self._sandbox_name = sandbox_name
         self.root = Path(root).resolve()
         self.options = options
+        self._file_request_timeout_sec = float(max(30, min(options.timeout_sec, 120)))
+        self._control_request_timeout_sec = float(max(30, min(options.timeout_sec, 300)))
+        # Sync budget should follow the configured sandbox timeout budget to avoid
+        # premature sync aborts on large/slow repo transfers.
+        self._sync_budget_sec = float(max(90, options.timeout_sec))
 
         try:
             from e2b_code_interpreter import Sandbox as E2BSandbox
@@ -75,12 +81,14 @@ class E2BFirecrackerSandbox:
             cmd_str = f"env {env_pairs} {cmd_str}"
         local_cwd = self.root if cwd is None else self._resolve_local_path(cwd)
         remote_cwd = self._to_remote_dir(local_cwd)
+        command_request_timeout = float(max(timeout_sec + 30, int(self._control_request_timeout_sec)))
 
         self._sync_local_to_remote()
-        result = self._sandbox.commands.run(
+        result = self._commands_run(
             cmd_str,
             cwd=remote_cwd,
             timeout=float(timeout_sec),
+            request_timeout=command_request_timeout,
         )
         self._sync_remote_to_local()
 
@@ -116,7 +124,7 @@ class E2BFirecrackerSandbox:
         resolved.write_text(content, encoding="utf-8")
 
         remote_path = self._to_remote_file(resolved)
-        self._sandbox.files.write(remote_path, content)
+        self._files_write(remote_path, content, request_timeout=self._file_request_timeout_sec)
 
     def apply_patch(self, patch_text: str) -> None:
         # Keep local git history authoritative for merge orchestration.
@@ -134,31 +142,54 @@ class E2BFirecrackerSandbox:
         except Exception:  # noqa: BLE001
             pass
 
+    def _is_within_root(self, path: Path) -> bool:
+        """Return True only if *resolved* path is inside self.root."""
+        try:
+            path.resolve().relative_to(self.root)
+            return True
+        except ValueError:
+            return False
+
     def _sync_local_to_remote(self) -> None:
+        start = time.monotonic()
         executable_paths: List[str] = []
         for path in sorted(self.root.rglob("*")):
             if path.is_symlink():
+                continue
+            # Guard against directory symlinks followed by rglob in
+            # Python < 3.13 — reject any resolved path outside root.
+            if not self._is_within_root(path):
                 continue
             rel = path.relative_to(self.root)
             remote_path = f"{self._remote_root}/{rel.as_posix()}"
 
             if path.is_dir():
-                self._sandbox.files.make_dir(remote_path)
+                self._ensure_sync_budget(start=start, operation=f"mkdir {remote_path}")
+                self._files_make_dir(remote_path, request_timeout=self._file_request_timeout_sec)
                 continue
 
             if not path.is_file():
                 continue
 
             data = path.read_bytes()
-            self._sandbox.files.write(remote_path, data)
+            self._ensure_sync_budget(start=start, operation=f"write {remote_path}")
+            self._files_write(remote_path, data, request_timeout=self._file_request_timeout_sec)
             if path.stat().st_mode & 0o111:
                 executable_paths.append(remote_path)
 
         for remote_path in executable_paths:
+            self._ensure_sync_budget(start=start, operation=f"chmod {remote_path}")
             self._run_remote(f"chmod +x {shell_quote([remote_path])}", cwd=self._remote_root)
 
     def _sync_remote_to_local(self) -> None:
-        entries = self._sandbox.files.list(self._remote_root, depth=128)
+        start = time.monotonic()
+        self._ensure_sync_budget(start=start, operation="list remote files")
+        entries = self._files_list(
+            self._remote_root,
+            depth=128,
+            request_timeout=self._control_request_timeout_sec,
+        )
+        self._ensure_sync_budget(start=start, operation="list remote files (post)")
 
         remote_dirs = set()
         remote_files = set()
@@ -184,6 +215,8 @@ class E2BFirecrackerSandbox:
         for path in sorted(self.root.rglob("*"), reverse=True):
             if not path.is_file() or path.is_symlink():
                 continue
+            if not self._is_within_root(path):
+                continue
             rel = path.relative_to(self.root)
             if rel not in remote_files:
                 path.unlink(missing_ok=True)
@@ -194,7 +227,12 @@ class E2BFirecrackerSandbox:
         for rel in sorted(remote_files):
             local_path = self.root / rel
             local_path.parent.mkdir(parents=True, exist_ok=True)
-            data = self._sandbox.files.read(f"{self._remote_root}/{rel.as_posix()}", format="bytes")
+            self._ensure_sync_budget(start=start, operation=f"read {rel.as_posix()}")
+            data = self._files_read(
+                f"{self._remote_root}/{rel.as_posix()}",
+                format="bytes",
+                request_timeout=self._file_request_timeout_sec,
+            )
             local_path.write_bytes(bytes(data))
 
     def _to_remote_dir(self, local_dir: Path) -> str:
@@ -211,9 +249,56 @@ class E2BFirecrackerSandbox:
         return resolve_within_root(root=self.root, raw_path=raw)
 
     def _run_remote(self, command: str, *, cwd: str | None) -> None:
-        result = self._sandbox.commands.run(command, cwd=cwd, timeout=120)
+        result = self._commands_run(
+            command,
+            cwd=cwd,
+            timeout=120.0,
+            request_timeout=max(self._control_request_timeout_sec, 150.0),
+        )
         if result.exit_code != 0 or result.error:
             raise RuntimeError(f"e2b command failed: {command}; stderr={result.stderr}; error={result.error}")
+
+    def _commands_run(
+        self,
+        command: str,
+        *,
+        cwd: str | None,
+        timeout: float,
+        request_timeout: float,
+    ):
+        try:
+            return self._sandbox.commands.run(
+                command,
+                cwd=cwd,
+                timeout=timeout,
+                request_timeout=request_timeout,
+            )
+        except TypeError:
+            return self._sandbox.commands.run(command, cwd=cwd, timeout=timeout)
+
+    def _files_make_dir(self, path: str, *, request_timeout: float):
+        try:
+            return self._sandbox.files.make_dir(path, request_timeout=request_timeout)
+        except TypeError:
+            return self._sandbox.files.make_dir(path)
+
+    def _files_write(self, path: str, data: str | bytes, *, request_timeout: float):
+        try:
+            return self._sandbox.files.write(path, data, request_timeout=request_timeout)
+        except TypeError:
+            return self._sandbox.files.write(path, data)
+
+    def _files_list(self, path: str, *, depth: int, request_timeout: float):
+        try:
+            return self._sandbox.files.list(path, depth=depth, request_timeout=request_timeout)
+        except TypeError:
+            return self._sandbox.files.list(path, depth=depth)
+
+    def _files_read(self, path: str, *, format: str, request_timeout: float):
+        try:
+            return self._sandbox.files.read(path, format=format, request_timeout=request_timeout)
+        except TypeError:
+            return self._sandbox.files.read(path, format=format)
 
     def _translate_env(self, env: Dict[str, str]) -> Dict[str, str]:
         translated: Dict[str, str] = {}
@@ -232,3 +317,11 @@ class E2BFirecrackerSandbox:
         if not rel.parts:
             return self._remote_root
         return f"{self._remote_root}/{rel.as_posix()}"
+
+    def _ensure_sync_budget(self, *, start: float, operation: str) -> None:
+        elapsed = time.monotonic() - start
+        if elapsed <= self._sync_budget_sec:
+            return
+        raise TimeoutError(
+            f"e2b sync exceeded {self._sync_budget_sec:.1f}s while {operation}"
+        )

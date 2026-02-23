@@ -10,7 +10,7 @@ import json
 import re
 import statistics
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -18,7 +18,8 @@ from typing import Any, Dict, List, Optional
 import yaml
 from pydantic import BaseModel, Field
 
-from .controller import run_benchmark
+from .controller import replay_events, run_benchmark
+from .hidden_result import hidden_failure_reason, hidden_stderr_excerpt, normalize_error
 from .io_utils import read_yaml_mapping
 
 
@@ -152,7 +153,7 @@ def run_experiment(
         for fut in as_completed(futures):
             record = fut.result()
             records.append(record)
-            _append_jsonl(results_path, _record_to_dict(record))
+            _append_jsonl(results_path, asdict(record))
 
     summary = _summarize_records(records)
     summary_payload = {
@@ -191,6 +192,36 @@ def _run_rollout_job(
     runs_root: Path,
     allow_noop: bool,
 ) -> RolloutRecord:
+    def make_record(**overrides: Any) -> RolloutRecord:
+        payload: Dict[str, Any] = {
+            "experiment_id": experiment_id,
+            "lineup": lineup.name,
+            "task_dir": str(task_dir),
+            "task_id": task_id,
+            "rollout_index": rollout_index,
+            "run_id": run_id,
+            "status": "infra_error",
+            "hidden_pass": None,
+            "public_pass": None,
+            "wall_clock_sec": None,
+            "review_iterations": None,
+            "merge_conflicts": None,
+            "tool_calls": None,
+            "env_cycles_used": None,
+            "log_queries_used": None,
+            "metric_queries_used": None,
+            "role_phase_failures": None,
+            "coordination_messages_total": None,
+            "coordination_claim_events_total": None,
+            "coordination_tasks_completed": None,
+            "coordination_tasks_failed": None,
+            "failure_bucket": None,
+            "failure_reason": None,
+            "manifest_path": None,
+        }
+        payload.update(overrides)
+        return RolloutRecord(**payload)
+
     try:
         manifest = run_benchmark(
             task_dir=str(task_dir),
@@ -201,7 +232,16 @@ def _run_rollout_job(
             allow_noop=allow_noop,
         )
         run_dir = runs_root / run_id
-        extra = _extract_event_usage(run_dir)
+        try:
+            extra = replay_events(str(run_dir))
+        except FileNotFoundError:
+            extra = {
+                "tool_calls": None,
+                "env_cycles_used": None,
+                "log_queries_used": None,
+                "metric_queries_used": None,
+                "role_phase_failures": None,
+            }
         hidden_infra_error = bool(manifest.metrics.get("hidden_infra_error"))
         status = "infra_error" if hidden_infra_error else "ok"
         failure_bucket = _infer_failure_bucket(
@@ -213,15 +253,12 @@ def _run_rollout_job(
         failure_reason = None
         if hidden_infra_error:
             failure_bucket = "infra_runtime"
-            failure_reason = _hidden_stderr_excerpt(run_dir)
+            failure_reason = hidden_stderr_excerpt(run_dir)
+        elif manifest.hidden_pass is False:
+            failure_reason = hidden_failure_reason(run_dir)
 
-        return RolloutRecord(
-            experiment_id=experiment_id,
-            lineup=lineup.name,
-            task_dir=str(task_dir),
+        return make_record(
             task_id=manifest.task_id,
-            rollout_index=rollout_index,
-            run_id=run_id,
             status=status,
             hidden_pass=manifest.hidden_pass,
             public_pass=manifest.public_pass,
@@ -243,31 +280,12 @@ def _run_rollout_job(
         )
     except Exception as exc:  # noqa: BLE001
         reason = str(exc)
-        return RolloutRecord(
-            experiment_id=experiment_id,
-            lineup=lineup.name,
-            task_dir=str(task_dir),
-            task_id=task_id,
-            rollout_index=rollout_index,
-            run_id=run_id,
-            status="error",
-            hidden_pass=None,
-            public_pass=None,
-            wall_clock_sec=None,
-            review_iterations=None,
-            merge_conflicts=None,
-            tool_calls=None,
-            env_cycles_used=None,
-            log_queries_used=None,
-            metric_queries_used=None,
-            role_phase_failures=None,
-            coordination_messages_total=None,
-            coordination_claim_events_total=None,
-            coordination_tasks_completed=None,
-            coordination_tasks_failed=None,
-            failure_bucket=_classify_failure_text(reason),
+        status = "timeout" if _is_timeout_text(reason) else "infra_error"
+        bucket = "timeout" if status == "timeout" else "infra_runtime"
+        return make_record(
+            status=status,
+            failure_bucket=bucket,
             failure_reason=reason,
-            manifest_path=None,
         )
 
 
@@ -305,34 +323,25 @@ def _write_agents_config_for_lineup(*, experiment_dir: Path, lineup: LineupSpec)
         "LOOPBENCH_DISABLE_SUBAGENTS": "1",
     }
     role_env.update(lineup.role_env)
+    role_specs = [
+        ("planner_reviewer", lineup.planner_model),
+        ("coder_a", lineup.coder_a_model),
+        ("coder_b", lineup.coder_b_model),
+    ]
+    roles = [
+        {
+            "name": name,
+            "model": model,
+            "max_tokens": 200000,
+            "driver": "shell",
+            "command": lineup.role_command,
+            "env": role_env,
+        }
+        for name, model in role_specs
+    ]
 
     payload = {
-        "roles": [
-            {
-                "name": "planner_reviewer",
-                "model": lineup.planner_model,
-                "max_tokens": 200000,
-                "driver": "shell",
-                "command": lineup.role_command,
-                "env": role_env,
-            },
-            {
-                "name": "coder_a",
-                "model": lineup.coder_a_model,
-                "max_tokens": 200000,
-                "driver": "shell",
-                "command": lineup.role_command,
-                "env": role_env,
-            },
-            {
-                "name": "coder_b",
-                "model": lineup.coder_b_model,
-                "max_tokens": 200000,
-                "driver": "shell",
-                "command": lineup.role_command,
-                "env": role_env,
-            },
-        ],
+        "roles": roles,
         "scheduling": {
             "mode": "phased",
             "max_review_rounds": 3,
@@ -362,83 +371,6 @@ def _build_run_id(experiment_id: str, lineup_name: str, task_id: str, rollout_in
     base = f"{experiment_id}_{lineup_name}_{task_id}_r{rollout_index:02d}"
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base)
     return safe[:120]
-
-
-def _extract_event_usage(run_dir: Path) -> Dict[str, Optional[int]]:
-    path = run_dir / "events.jsonl"
-    if not path.exists():
-        return {
-            "tool_calls": None,
-            "env_cycles_used": None,
-            "log_queries_used": None,
-            "metric_queries_used": None,
-            "role_phase_failures": None,
-        }
-
-    tool_calls = 0
-    env_cycles = 0
-    log_queries = 0
-    metric_queries = 0
-    role_phase_failures = 0
-
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            if not line.strip():
-                continue
-            event = json.loads(line)
-            if event.get("type") == "role_phase":
-                payload = event.get("payload") or {}
-                if payload.get("ok") is False:
-                    role_phase_failures += 1
-                continue
-            if event.get("type") != "tool_call":
-                continue
-            payload = event.get("payload") or {}
-            tool = payload.get("tool")
-            tool_calls += 1
-            if tool in {"env.up", "env.down"}:
-                env_cycles += 1
-            elif tool == "env.logs_query":
-                log_queries += 1
-            elif tool == "env.metrics_query":
-                metric_queries += 1
-
-    return {
-        "tool_calls": tool_calls,
-        "env_cycles_used": env_cycles,
-        "log_queries_used": log_queries,
-        "metric_queries_used": metric_queries,
-        "role_phase_failures": role_phase_failures,
-    }
-
-
-def _record_to_dict(record: RolloutRecord) -> Dict[str, Any]:
-    return {
-        "experiment_id": record.experiment_id,
-        "lineup": record.lineup,
-        "task_dir": record.task_dir,
-        "task_id": record.task_id,
-        "rollout_index": record.rollout_index,
-        "run_id": record.run_id,
-        "status": record.status,
-        "hidden_pass": record.hidden_pass,
-        "public_pass": record.public_pass,
-        "wall_clock_sec": record.wall_clock_sec,
-        "review_iterations": record.review_iterations,
-        "merge_conflicts": record.merge_conflicts,
-        "tool_calls": record.tool_calls,
-        "env_cycles_used": record.env_cycles_used,
-        "log_queries_used": record.log_queries_used,
-        "metric_queries_used": record.metric_queries_used,
-        "role_phase_failures": record.role_phase_failures,
-        "coordination_messages_total": record.coordination_messages_total,
-        "coordination_claim_events_total": record.coordination_claim_events_total,
-        "coordination_tasks_completed": record.coordination_tasks_completed,
-        "coordination_tasks_failed": record.coordination_tasks_failed,
-        "failure_bucket": record.failure_bucket,
-        "failure_reason": record.failure_reason,
-        "manifest_path": record.manifest_path,
-    }
 
 
 def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
@@ -471,9 +403,9 @@ def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
         coord_tasks_failed = [r.coordination_tasks_failed for r in recs if r.coordination_tasks_failed is not None]
 
         failure_counter = Counter(
-            _normalize_error(r.failure_reason)
+            normalize_error(r.failure_reason)
             for r in recs
-            if r.status != "ok" and r.failure_reason
+            if ((r.status != "ok") or (r.hidden_pass is False)) and r.failure_reason
         )
         bucket_counter = Counter(
             r.failure_bucket or "unknown"
@@ -538,10 +470,10 @@ def _render_feedback(summary_payload: Dict[str, Any], records: List[RolloutRecor
         )
     lines.append("")
 
-    failing = [r for r in records if r.status != "ok"]
+    failing = [r for r in records if (r.status != "ok") or (r.hidden_pass is False)]
     if failing:
         lines.append("## Top Failures")
-        counts = Counter(_normalize_error(r.failure_reason) for r in failing if r.failure_reason)
+        counts = Counter(normalize_error(r.failure_reason) for r in failing if r.failure_reason)
         for reason, count in counts.most_common(10):
             lines.append(f"- {reason}: {count}")
         lines.append("")
@@ -564,14 +496,6 @@ def _render_feedback(summary_payload: Dict[str, Any], records: List[RolloutRecor
     lines.append("")
 
     return "\n".join(lines) + "\n"
-
-
-def _normalize_error(text: Optional[str]) -> str:
-    if not text:
-        return "unknown"
-    line = text.strip().splitlines()[0]
-    line = re.sub(r"\s+", " ", line)
-    return line[:220]
 
 
 def _infer_failure_bucket(
@@ -653,17 +577,18 @@ def _classify_failure_text(text: Optional[str]) -> str:
     return "other"
 
 
-def _hidden_stderr_excerpt(run_dir: Path) -> Optional[str]:
-    log_path = run_dir / "hidden_validate" / "result.log"
-    if not log_path.exists():
-        return None
-    text = log_path.read_text(encoding="utf-8", errors="replace")
-    marker = "\n\nSTDERR\n"
-    idx = text.find(marker)
-    if idx == -1:
-        return _normalize_error(text)
-    stderr = text[idx + len(marker):].strip()
-    return _normalize_error(stderr)
+def _is_timeout_text(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    s = text.lower()
+    patterns = [
+        "timed out",
+        "timeout",
+        "deadline exceeded",
+        "wall clock",
+        "max review rounds",
+    ]
+    return any(p in s for p in patterns)
 
 
 def _ratio(a: int, b: int) -> float:

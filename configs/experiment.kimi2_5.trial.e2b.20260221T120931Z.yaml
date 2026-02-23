@@ -7,7 +7,7 @@ lineups:
     planner_model: moonshotai/kimi-k2.5
     coder_a_model: moonshotai/kimi-k2.5
     coder_b_model: moonshotai/kimi-k2.5
-    role_command: "/workspace/loopbench_project_spec/scripts/openrouter_role_driver.py"
+    role_command: scripts/openrouter_role_driver.py
     role_env:
       OPENROUTER_API_KEY_ENV: OPEN_ROUTER_API_KEY
       OPENROUTER_APP_TITLE: loopbench-team

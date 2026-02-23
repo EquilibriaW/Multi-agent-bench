@@ -1,0 +1,40 @@
+experiment_id: kimi2_5-team-trial-10x3-20260222
+
+tasks:
+  # Easy
+  - .tmp/abc_out/task_air_go_rpc__health_and_diagnostics
+  - .tmp/abc_out/task_composer_packagist__downloads_metrics
+  - .tmp/abc_out/task_crmne_ruby_llm__health
+
+  # Medium
+  - .tmp/abc_out/task_hagopj13_node_express_boilerplate__users
+  - .tmp/abc_out/task_cornflourblue_dotnet_6_crud_api__users
+  - .tmp/abc_out/task_15dkatz_official_joke_api__filtered_joke_lookup
+
+  # Hard
+  - .tmp/abc_out/task_99designs_gqlgen__todo_graphql_api
+  - .tmp/abc_out/task_air_go_rpc__utility
+  - .tmp/abc_out/task_ashirt_ops_ashirt_server__health
+  - .tmp/abc_out/task_ankitpokhrel_tus_php__tus_upload_management
+
+lineups:
+  - name: kimi2_5-team
+    planner_model: moonshotai/kimi-k2.5
+    coder_a_model: moonshotai/kimi-k2.5
+    coder_b_model: moonshotai/kimi-k2.5
+    role_command: scripts/openrouter_role_driver.py
+    role_env:
+      OPENROUTER_API_KEY_ENV: OPEN_ROUTER_API_KEY
+      OPENROUTER_APP_TITLE: loopbench-team
+      OPENROUTER_HTTP_REFERER: https://localhost/loopbench
+      OPENROUTER_TEMPERATURE: "0.2"
+      OPENROUTER_MAX_TOKENS: "4096"
+      OPENROUTER_HTTP_TIMEOUT_SEC: "60"
+      OPENROUTER_HTTP_RETRIES: "2"
+      OPENROUTER_STRUCTURED_RETRIES: "2"
+      LOOPBENCH_ROLE_TIMEOUT_SEC: "900"
+
+rollouts_per_task: 3
+max_parallel_rollouts: 5
+available_agent_sandboxes: 20
+runtime_config: configs/runtime.e2b.openrouter.yaml

@@ -29,6 +29,7 @@ class TeamProtocol:
         self.db = db
         self.planner = planner
         self.coders = list(coders)
+        self._implementation_paths_by_role: Dict[str, List[str]] = {}
 
     @property
     def db_path(self) -> Path:
@@ -51,6 +52,7 @@ class TeamProtocol:
         subtasks_path: Path,
         subtasks: List[Dict[str, Any]],
     ) -> int:
+        self._implementation_paths_by_role = self._collect_paths_by_role(subtasks)
         seeded = self.db.seed_tasks(phase="implementation", subtasks=subtasks)
         self.db.post_message(
             phase="implementation",
@@ -73,13 +75,16 @@ class TeamProtocol:
         round_index: int,
         validation_stdout: str,
         validation_stderr: str,
+        planner_feedback_by_role: Optional[Dict[str, str]] = None,
     ) -> ReworkSeed:
         phase = self.rework_phase(round_index)
+        feedback_by_role = planner_feedback_by_role or {}
         subtasks = [
             {
                 "id": f"R{round_index}_{coder}",
                 "role": coder,
                 "title": f"Rework for review round {round_index}",
+                "paths": list(self._implementation_paths_by_role.get(coder) or []),
                 "acceptance": "Address planner feedback and unblock public validation.",
             }
             for coder in self.coders
@@ -97,6 +102,7 @@ class TeamProtocol:
                     "subtask": subtask,
                     "public_validate_stdout_tail": validation_stdout[-3000:],
                     "public_validate_stderr_tail": validation_stderr[-3000:],
+                    "planner_feedback": feedback_by_role.get(str(subtask["role"]), ""),
                 },
             )
 
@@ -215,3 +221,24 @@ class TeamProtocol:
                 round_index=round_index,
                 body={"subtask": item},
             )
+
+    def _collect_paths_by_role(self, subtasks: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for item in subtasks:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if not role:
+                continue
+            raw_paths = item.get("paths")
+            if not isinstance(raw_paths, list):
+                continue
+            bucket = out.setdefault(role, [])
+            for raw_path in raw_paths:
+                if not isinstance(raw_path, str):
+                    continue
+                path = raw_path.strip()
+                if not path or path in bucket:
+                    continue
+                bucket.append(path)
+        return out

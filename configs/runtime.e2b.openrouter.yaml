@@ -12,10 +12,12 @@ env_runner:
   kind: host_process
   image: null
   substrate_default: compose
+  docker_host: null
+  buildx_config: .loopbench/docker_buildx
   observability:
     logs: loki
     metrics: prometheus
-    traces: none
+    traces: langsmith
     logs_endpoint: null
     metrics_endpoint: null
     traces_endpoint: null
@@ -25,6 +27,7 @@ judge:
   image: ghcr.io/loopbench/judge:latest
   network: none
   docker_host: null
+  buildx_config: .loopbench/docker_buildx
 
 storage:
   workspace_root: workspaces

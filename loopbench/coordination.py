@@ -160,7 +160,6 @@ class CoordinationDB:
 
     def claim_next_task(self, *, phase: str, role: str) -> Optional[ClaimedTask]:
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 SELECT task_id, phase, assigned_role, title, payload_json
@@ -172,11 +171,13 @@ class CoordinationDB:
                 (phase, role),
             ).fetchone()
             if row is None:
-                conn.execute("COMMIT")
                 return None
 
             claim_token = str(uuid.uuid4())
             now = self._now_ms()
+            # The UPDATE's WHERE status='pending' guard ensures
+            # correctness even if another thread read the same row:
+            # only one UPDATE will match.
             updated = conn.execute(
                 """
                 UPDATE tasks
@@ -186,7 +187,6 @@ class CoordinationDB:
                 (claim_token, role, now, row["task_id"]),
             )
             if updated.rowcount != 1:
-                conn.execute("ROLLBACK")
                 return None
 
             conn.execute(
@@ -202,7 +202,7 @@ class CoordinationDB:
                     json.dumps({"claim_token": claim_token}),
                 ),
             )
-            conn.execute("COMMIT")
+            # Context manager commits the UPDATE + INSERT atomically.
 
             return ClaimedTask(
                 task_id=str(row["task_id"]),
@@ -343,15 +343,19 @@ class CoordinationDB:
         return row is not None
 
     def _connect(self) -> sqlite3.Connection:
+        # Default isolation_level="" (DEFERRED) lets the context manager
+        # handle BEGIN/COMMIT/ROLLBACK automatically, making every
+        # `with conn:` block atomic.  Previous isolation_level=None
+        # (autocommit) silently broke atomicity for multi-statement
+        # methods like seed_tasks, complete_task, and fail_task.
         conn = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
-            isolation_level=None,
             check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 

@@ -48,6 +48,8 @@ class EnvRunnerConfig(BaseModel):
     kind: Literal["docker_service", "host_process"] = "host_process"
     image: Optional[str] = None
     substrate_default: Literal["compose", "kind", "none"] = "none"
+    docker_host: Optional[str] = None
+    buildx_config: Optional[str] = None
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
 
@@ -56,6 +58,7 @@ class JudgeRuntimeConfig(BaseModel):
     image: Optional[str] = None
     network: Optional[str] = None
     docker_host: Optional[str] = None
+    buildx_config: Optional[str] = None
 
 
 class StorageConfig(BaseModel):

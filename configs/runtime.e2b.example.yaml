@@ -12,6 +12,7 @@ env_runner:
   kind: host_process
   image: null
   substrate_default: compose
+  docker_host: null
   observability:
     logs: loki
     metrics: prometheus

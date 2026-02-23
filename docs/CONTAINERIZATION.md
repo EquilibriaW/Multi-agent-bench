@@ -165,9 +165,18 @@ Example:
 REGISTRY=ghcr.io/your-org TAG=v0.1.0 scripts/build_images.sh
 ```
 
-Judge endpoint option (integrity-first):
-- configure `judge.docker_host` in runtime YAML to point the judge to a stable
-  Docker endpoint (`DOCKER_HOST`), e.g. `ssh://loopbench@judge-vm`.
+Docker endpoint options (integrity-first):
+- configure `env_runner.docker_host` in runtime YAML to point substrate
+  operations (`env.up/down`, compose logs) to a stable Docker endpoint.
+- configure `judge.docker_host` to point hidden validation to its Docker
+  endpoint.
+- configure `env_runner.buildx_config` / `judge.buildx_config` to a writable
+  path (for example `.loopbench/docker_buildx`) to prevent buildx activity
+  permission failures on constrained hosts.
+- `env_runner.docker_host` is never inherited from `judge.docker_host`;
+  sharing a remote daemon must be configured explicitly on `env_runner`.
+- `env_runner.buildx_config` may still fall back to `judge.buildx_config`
+  when omitted, to keep buildx cache path behavior compatible.
 - this avoids nested-host daemon flakiness while preserving agent sandbox isolation.
 
 ## 9) E2B backend option

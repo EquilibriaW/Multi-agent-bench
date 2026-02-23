@@ -75,3 +75,11 @@ If `sandbox_backend.kind` is `e2b_firecracker`, preflight also checks:
 Preflight also reports observability readiness:
 - `observability.logs=loki` expects `logs_endpoint`
 - `observability.metrics=prometheus` expects `metrics_endpoint`
+- `observability.traces=langsmith` expects:
+  - `langsmith` Python package installed
+  - `LANGSMITH_API_KEY` (or `LANGCHAIN_API_KEY`) set
+  - optional `traces_endpoint` for self-hosted LangSmith
+
+LangSmith tracing integration is fail-open:
+- if tracing fails at runtime, benchmark execution continues and trace status is written to `runs/<run_id>/trace/session.json`
+- baseline runs remain unchanged when `observability.traces: none`

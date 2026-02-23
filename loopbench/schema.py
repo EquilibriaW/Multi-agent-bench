@@ -41,6 +41,7 @@ class SubstrateSpec(BaseModel):
     up_cmd: Optional[str] = None
     down_cmd: Optional[str] = None
     public_validate_cmd: Optional[str] = None
+    public_validate_policy: Literal["off", "advisory", "required"] = "advisory"
 
 
 class FeedbackSurfaces(BaseModel):

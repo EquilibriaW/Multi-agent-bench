@@ -5,6 +5,10 @@ Hidden validation runner using a fresh repo checkout.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+import fcntl
+import re
 import shutil
 from pathlib import Path
 
@@ -50,7 +54,10 @@ class LocalJudge:
                     f"{docker_check.stderr}"
                 )
 
-        judge_root = self.run_dir / "hidden_validate" / "judge_workspace"
+        # Place the judge workspace outside the per-run directory tree so that
+        # agents using a local-process sandbox cannot discover hidden tests by
+        # walking up from their worktree into runs/<run_id>/hidden_validate/.
+        judge_root = self.run_dir.parent / ".judge_workspaces" / self.run_dir.name
         repo_dir = judge_root / "repo"
 
         if judge_root.exists():
@@ -102,14 +109,23 @@ class LocalJudge:
             "LOOPBENCH_PUBLIC_DIR": str(judge_root / "public"),
         }
         run_env = {**env, **self.docker_env}
-        result = run_shell(
-            self.task.judge.hidden_validate_cmd,
-            cwd=judge_root,
-            timeout_sec=self.task.judge.timeout_sec,
-            env=run_env,
+        lock_ctx = (
+            _judge_docker_runtime_lock(runs_root=self.run_dir.parent, docker_env=self.docker_env)
+            if self.require_docker
+            else nullcontext(None)
         )
+        with lock_ctx as lock_path:
+            result = run_shell(
+                self.task.judge.hidden_validate_cmd,
+                cwd=judge_root,
+                timeout_sec=self.task.judge.timeout_sec,
+                env=run_env,
+            )
         stderr = result.stderr
-        infra_error = bool(docker_diag and not result.ok)
+        infra_error = bool(
+            (docker_diag and not result.ok)
+            or (not result.ok and _is_likely_docker_infra_failure(stderr=result.stderr, stdout=result.stdout))
+        )
         if docker_diag and not result.ok:
             stderr = f"{docker_diag}\n\n{stderr}".strip()
 
@@ -130,7 +146,9 @@ class LocalJudge:
             exit_code=result.exit_code,
             data={
                 "result_log": str(out_path),
+                "judge_workspace": str(judge_root),
                 "infra_error": infra_error,
+                "docker_lock_path": str(lock_path) if lock_path else None,
             },
         )
 
@@ -140,3 +158,46 @@ def build_judge(*, task: TaskPack, run_dir: str | Path, judge_cfg: JudgeRuntimeC
     if judge_cfg.kind == "docker_container":
         return LocalJudge(task=task, run_dir=run_dir, require_docker=True, docker_env=docker_env)
     return LocalJudge(task=task, run_dir=run_dir, require_docker=False, docker_env=docker_env)
+
+
+_INFRA_ERROR_SUBSTRINGS = (
+    "cannot connect to the docker daemon",
+    "error during connect",
+    "permission denied while trying to connect to the docker daemon socket",
+    "failed to update builder last activity time",
+    "apt-get: command not found",
+    "two workspace members are both named",
+)
+
+
+def _is_likely_docker_infra_failure(*, stderr: str, stdout: str) -> bool:
+    text = f"{stderr}\n{stdout}".lower()
+    if any(marker in text for marker in _INFRA_ERROR_SUBSTRINGS):
+        return True
+    if "/.docker/buildx/activity" in text and "operation not permitted" in text:
+        return True
+    if "no solution found when resolving dependencies" in text and "pytest==8.4.1 depends on python>=3.9" in text:
+        return True
+    return False
+
+
+@contextmanager
+def _judge_docker_runtime_lock(*, runs_root: Path, docker_env: dict[str, str]) -> Iterator[Path]:
+    lock_root = runs_root / ".locks"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    host_token = _docker_host_lock_token(docker_env.get("DOCKER_HOST"))
+    lock_path = lock_root / f"judge_docker_{host_token}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield lock_path
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _docker_host_lock_token(raw_host: str | None) -> str:
+    text = (raw_host or "local").strip().lower()
+    if not text:
+        text = "local"
+    token = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return token or "local"

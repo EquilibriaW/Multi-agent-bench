@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List
 
-from .interfaces import Workspace
 from .repo_materializer import configure_git_identity, materialize_repo
 from .schema import TaskPack
 from .shell import ensure_success, run_command
@@ -33,7 +32,7 @@ class WorkspaceManager:
         self.workspace_root_base = self.project_root / workspace_root
         self.runs_root_base = self.project_root / runs_root
 
-    def provision(self, run_id: str, task: TaskPack, roles: Iterable[str] = DEFAULT_ROLES) -> tuple[Workspace, RunPaths]:
+    def provision(self, run_id: str, task: TaskPack, roles: Iterable[str] = DEFAULT_ROLES) -> RunPaths:
         role_list = list(roles)
         if not role_list:
             raise ValueError("at least one role is required")
@@ -92,13 +91,6 @@ class WorkspaceManager:
 
         self._init_run_docs(run_dir)
 
-        workspace = Workspace(
-            root=str(workspace_root),
-            base_repo_path=str(base_repo_path),
-            worktrees_dir=str(worktrees_dir),
-            artifacts_dir=str(run_dir),
-        )
-
         run_paths = RunPaths(
             workspace_root=workspace_root,
             runs_root=runs_root,
@@ -106,7 +98,7 @@ class WorkspaceManager:
             role_paths=role_paths,
             base_commit=base_commit,
         )
-        return workspace, run_paths
+        return run_paths
 
     def _git(self, repo: Path, args: List[str]) -> str:
         result = run_command(["git", "-C", str(repo), *args])
@@ -140,4 +132,6 @@ class WorkspaceManager:
 
         public_link = role_path / "public"
         if not public_link.exists():
-            public_link.symlink_to(target_public, target_is_directory=True)
+            # Relative symlink keeps the worktree self-contained and avoids
+            # leaking absolute host paths into container/E2B mounts.
+            public_link.symlink_to(Path(".loopbench", "public"), target_is_directory=True)
