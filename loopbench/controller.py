@@ -8,7 +8,17 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import sys
 import tarfile
+import threading
+import time
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    wait as futures_wait,
+    FIRST_COMPLETED,
+    FIRST_EXCEPTION,
+)
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -40,6 +50,7 @@ def run_benchmark(
     agents_config_path: str,
     project_root: str | Path,
     allow_noop: bool = False,
+    shutdown_event: threading.Event | None = None,
 ) -> RunManifest:
     started_at = _now_iso()
 
@@ -107,23 +118,116 @@ def run_benchmark(
     trace_error: str | None = None
     trace_outputs: Dict[str, Any] | None = None
     sandboxes = {}
+    harness_cancel_event = threading.Event()
+
+    # Thread-safe registry: _create_role_infra adds every sandbox here
+    # immediately after creation, so the outer finally can close ALL of
+    # them — even ones from futures we abandoned.
+    all_created_sandboxes: Dict[str, Any] = {}
+    _sandbox_registry_lock = threading.Lock()
+    init_cancel_event = threading.Event()
+
+    # Propagate external shutdown signal to both cancel events so that
+    # SIGTERM interrupts sandbox init (init_cancel_event) as well as
+    # in-flight harness work (harness_cancel_event).
+    if shutdown_event is not None:
+        def _watch_shutdown():
+            shutdown_event.wait()
+            init_cancel_event.set()
+            harness_cancel_event.set()
+        _shutdown_watcher = threading.Thread(target=_watch_shutdown, daemon=True)
+        _shutdown_watcher.start()
     try:
         substrates: Dict[str, LocalSubstrate] = {}
         substrate_docker_env = env_runner_docker_env(runtime_cfg.env_runner, runtime_cfg.judge)
-        for role in roles:
-            sandboxes[role] = build_sandbox(
-                runtime_cfg=runtime_cfg,
-                role=role,
-                worktree_root=run_paths.role_paths[role],
-            )
-            substrates[role] = LocalSubstrate(
-                role=role,
-                worktree_path=run_paths.role_paths[role],
-                spec=task.substrate,
-                run_artifacts_dir=run_paths.run_dir,
-                observability=obs_settings,
-                docker_env=substrate_docker_env,
-            )
+        # Daemon workers ensure stalled sandbox init threads cannot keep
+        # the CLI process alive after timeout handling returns.
+        init_pool = _DaemonThreadPoolExecutor(max_workers=len(roles))
+        try:
+            futs = {
+                init_pool.submit(
+                    _create_role_infra, role,
+                    runtime_cfg=runtime_cfg,
+                    worktree_root=run_paths.role_paths[role],
+                    spec=task.substrate,
+                    run_artifacts_dir=run_paths.run_dir,
+                    obs=obs_settings,
+                    docker_env=substrate_docker_env,
+                    sandbox_registry=(all_created_sandboxes, _sandbox_registry_lock),
+                    cancel_event=init_cancel_event,
+                ): role
+                for role in roles
+            }
+            done, not_done = futures_wait(futs, timeout=_SANDBOX_CREATE_TIMEOUT_SEC, return_when=FIRST_EXCEPTION)
+
+            # Collect ALL successful results first so their sandboxes
+            # enter the dict (and thus get cleaned up by the outer finally).
+            first_exc = None
+            closed_stalled_sandbox_ids: set[int] = set()
+
+            def _collect_role_infra_results(completed) -> None:
+                nonlocal first_exc
+                for fut in completed:
+                    try:
+                        role, sandbox, substrate = fut.result()
+                        sandboxes[role] = sandbox
+                        substrates[role] = substrate
+                    except _SandboxInitCancelled:
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        if first_exc is None:
+                            first_exc = exc
+
+            def _close_stalled_role_sandboxes() -> None:
+                with _sandbox_registry_lock:
+                    leaked = {
+                        role: sandbox
+                        for role, sandbox in all_created_sandboxes.items()
+                        if role not in sandboxes and id(sandbox) not in closed_stalled_sandbox_ids
+                    }
+                if leaked:
+                    _close_sandboxes(leaked)
+                    closed_stalled_sandbox_ids.update(id(sandbox) for sandbox in leaked.values())
+
+            _collect_role_infra_results(done)
+
+            if not_done:
+                init_cancel_event.set()
+                for fut in not_done:
+                    fut.cancel()
+                # Stop queued futures from starting; cancel_futures=True
+                # prevents any not-yet-started workers from launching.
+                init_pool.shutdown(wait=False, cancel_futures=True)
+
+                # Allow already-running futures a short drain window so we
+                # can close sandboxes created after timeout and avoid leaks.
+                drain_deadline = time.monotonic() + _SANDBOX_DRAIN_TIMEOUT_SEC
+                pending = set(not_done)
+                while pending and time.monotonic() < drain_deadline:
+                    remaining = drain_deadline - time.monotonic()
+                    wait_timeout = min(0.25, max(0.01, remaining))
+                    newly_done, pending = futures_wait(
+                        pending,
+                        timeout=wait_timeout,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    _collect_role_infra_results(newly_done)
+                    _close_stalled_role_sandboxes()
+                _close_stalled_role_sandboxes()
+
+                # If a role raised (FIRST_EXCEPTION), propagate that —
+                # don't misclassify as a timeout.
+                if first_exc is not None:
+                    raise first_exc
+                raise RuntimeError(
+                    f"sandbox creation timed out after {_SANDBOX_CREATE_TIMEOUT_SEC}s "
+                    f"({len(not_done)} of {len(futs)} roles stalled)"
+                )
+
+            if first_exc is not None:
+                raise first_exc
+        finally:
+            init_pool.shutdown(wait=False)
 
         merged_budget = _merge_budget(task.budget, agents_cfg.budgets)
         router = DefaultToolRouter(
@@ -157,7 +261,35 @@ def run_benchmark(
                 ToolCall(ts_ms=now_ms(), role=planner_role, tool="env.up", args={})
             )
 
-        harness_result = harness.run(task=task, budget=merged_budget, tools=router)
+        # Cancellation token: set on wall-clock timeout so the harness
+        # thread stops at its next router.call() instead of running
+        # indefinitely in the background.
+        _install_cancel_guard(router, harness_cancel_event)
+
+        deadline_pool = _DaemonThreadPoolExecutor(max_workers=1)
+        deadline_future = deadline_pool.submit(harness.run, task=task, budget=merged_budget, tools=router)
+        try:
+            harness_result = deadline_future.result(timeout=merged_budget.wall_clock_sec)
+        except FuturesTimeoutError:
+            harness_cancel_event.set()
+            _cancel_substrates(substrates)
+            _close_sandboxes(sandboxes)
+            try:
+                deadline_future.result(timeout=_HARNESS_CANCEL_TIMEOUT_SEC)
+            except FuturesTimeoutError:
+                print(
+                    "[loopbench] warning: harness did not stop within "
+                    f"{_HARNESS_CANCEL_TIMEOUT_SEC}s after timeout cancellation",
+                    file=sys.stderr,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            deadline_pool.shutdown(wait=False)
+            raise RuntimeError(
+                f"wall clock timeout: budget exhausted ({merged_budget.wall_clock_sec}s)"
+            )
+        finally:
+            deadline_pool.shutdown(wait=False)
         role_heads = snapshot_role_repo_state(
             run_dir=run_paths.run_dir,
             role_paths=run_paths.role_paths,
@@ -172,7 +304,16 @@ def run_benchmark(
         workflow_summary_path = harness_result.get("workflow_summary_path")
         public_pass = bool(harness_result.get("public_pass"))
 
-        judge = build_judge(task=task, run_dir=run_paths.run_dir, judge_cfg=runtime_cfg.judge)
+        # Free agent sandboxes before creating the judge sandbox so we
+        # don't spike to 4 sandboxes per rollout simultaneously.
+        _teardown_substrates(substrates)
+        substrates.clear()
+        _close_sandboxes(sandboxes)
+        sandboxes.clear()
+        with _sandbox_registry_lock:
+            all_created_sandboxes.clear()
+
+        judge = build_judge(task=task, run_dir=run_paths.run_dir, judge_cfg=runtime_cfg.judge, runtime_cfg=runtime_cfg)
         hidden_result = judge.run_hidden_validation(final_patch_path=final_patch_path)
         hidden_summary = _summarize_hidden_result(
             hidden_result=hidden_result,
@@ -256,7 +397,18 @@ def run_benchmark(
             write_trace_snapshot(run_dir=run_paths.run_dir, snapshot=trace_session.snapshot())
         except Exception:  # noqa: BLE001
             pass
-        _close_sandboxes(sandboxes)
+        # Tear down Docker containers/networks before closing sandboxes
+        # so that cleanup runs even on timeout, SIGTERM, or crash paths.
+        _teardown_substrates(substrates)
+        # Close ALL sandboxes ever created (including ones from abandoned
+        # futures), not just the ones that made it into the `sandboxes` dict.
+        with _sandbox_registry_lock:
+            all_to_close = dict(all_created_sandboxes)
+        # Merge in any that are only in `sandboxes` (shouldn't happen,
+        # but defensive).
+        for k, v in sandboxes.items():
+            all_to_close.setdefault(k, v)
+        _close_sandboxes(all_to_close)
 
 
 def run_judge_only(task_dir: str, run_dir: str, runtime_config_path: str) -> ToolResult:
@@ -267,7 +419,7 @@ def run_judge_only(task_dir: str, run_dir: str, runtime_config_path: str) -> Too
         raise FileNotFoundError(f"final patch not found: {final_patch}")
 
     runtime_cfg = load_runtime_config(runtime_config_path)
-    judge = build_judge(task=task, run_dir=run_path, judge_cfg=runtime_cfg.judge)
+    judge = build_judge(task=task, run_dir=run_path, judge_cfg=runtime_cfg.judge, runtime_cfg=runtime_cfg)
     result = judge.run_hidden_validation(final_patch_path=str(final_patch))
 
     return result
@@ -355,20 +507,35 @@ def _role_output_metrics(*, role_outputs: Any, planner_role: str) -> tuple[Dict[
         phase = str(output.get("phase") or (key_parts[1] if len(key_parts) >= 2 else "unknown"))
 
         usage = output.get("openrouter_usage")
+        if not isinstance(usage, dict):
+            usage = output.get("usage")
         if isinstance(usage, dict):
             input_tokens = _as_nonnegative_int(usage.get("input_tokens"))
+            if input_tokens is None:
+                input_tokens = _as_nonnegative_int(usage.get("prompt_tokens"))
+
             output_tokens = _as_nonnegative_int(usage.get("output_tokens"))
+            if output_tokens is None:
+                output_tokens = _as_nonnegative_int(usage.get("completion_tokens"))
+
             total_tokens = _as_nonnegative_int(usage.get("total_tokens"))
-            if input_tokens is not None and output_tokens is not None and total_tokens is not None:
-                for bucket in (
-                    totals,
-                    per_role.setdefault(role, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
-                    per_phase.setdefault(phase, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
-                ):
-                    bucket["input_tokens"] += input_tokens
-                    bucket["output_tokens"] += output_tokens
-                    bucket["total_tokens"] += total_tokens
-                usage_entries += 1
+            if total_tokens is None:
+                total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+            usage_totals = {
+                "input_tokens": input_tokens or 0,
+                "output_tokens": output_tokens or 0,
+                "total_tokens": total_tokens,
+            }
+            for bucket in (
+                totals,
+                per_role.setdefault(role, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+                per_phase.setdefault(phase, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}),
+            ):
+                bucket["input_tokens"] += usage_totals["input_tokens"]
+                bucket["output_tokens"] += usage_totals["output_tokens"]
+                bucket["total_tokens"] += usage_totals["total_tokens"]
+            usage_entries += 1
 
         if role != planner_role:
             continue
@@ -505,10 +672,22 @@ def _inject_provider_env(*, agents_cfg: AgentsConfig) -> AgentsConfig:
         key_var = env.get("OPENROUTER_API_KEY_ENV") or env.get("OPEN_ROUTER_API_KEY_ENV")
         if isinstance(key_var, str) and key_var.strip():
             key_name = key_var.strip()
-            if key_name not in env:
-                key_value = os.environ.get(key_name)
-                if key_value:
-                    env[key_name] = key_value
+            key_candidates = []
+            for candidate in (key_name, "OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY"):
+                if candidate not in key_candidates:
+                    key_candidates.append(candidate)
+            if not env.get(key_name):
+                key_value = _first_non_empty_env(
+                    env,
+                    key_candidates,
+                )
+                if not key_value:
+                    raise RuntimeError(
+                        f"Required OpenRouter key env var is not set for role '{role.name}' "
+                        f"(referenced by OPENROUTER_API_KEY_ENV={key_name}). "
+                        f"Set one of: {', '.join(key_candidates)}."
+                    )
+                env[key_name] = key_value
         roles.append(role.model_copy(update={"env": env}))
     return agents_cfg.model_copy(update={"roles": roles})
 
@@ -573,11 +752,208 @@ def _run_output_payloads(
     }
     return event_payload, trace_payload
 
+_SANDBOX_CREATE_TIMEOUT_SEC = 300
+_SANDBOX_DRAIN_TIMEOUT_SEC = 30
+_SANDBOX_CREATE_MAX_ATTEMPTS = 5
+_HARNESS_CANCEL_TIMEOUT_SEC = 30
+
+
+class _SandboxInitCancelled(RuntimeError):
+    """Sandbox init was cancelled after a global timeout fired."""
+
+
+def _first_non_empty_env(local_env: Dict[str, str], names: List[str]) -> str | None:
+    for name in names:
+        value = local_env.get(name)
+        if isinstance(value, str) and value.strip():
+            return value
+        host_value = os.environ.get(name)
+        if isinstance(host_value, str) and host_value.strip():
+            return host_value
+    return None
+
+
+def _install_cancel_guard(router, cancel_event: threading.Event) -> None:
+    """Wrap *router.call* so it raises immediately when *cancel_event* is set.
+
+    Every harness action flows through ``router.call()``.  After the
+    wall-clock deadline fires, setting the event causes the background
+    harness thread to abort at its next tool call instead of continuing
+    to run commands against closed (or local-process) sandboxes.
+    """
+    original_call = router.call
+
+    def _guarded_call(tool_call):
+        if cancel_event.is_set():
+            raise RuntimeError("wall clock timeout: run cancelled")
+        return original_call(tool_call)
+
+    router.call = _guarded_call
+
+
+class _DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose worker threads are daemonic.
+
+    Daemon threads are killed when the main thread exits, so a timed-out
+    harness.run() cannot keep the process alive after the caller raises.
+    """
+
+    def _adjust_thread_count(self):
+        import weakref
+        from concurrent.futures.thread import _worker, _threads_queues
+
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            t = threading.Thread(
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            self._threads.add(t)
+            _threads_queues[t] = self._work_queue
+
+
+def _create_role_infra(
+    role,
+    *,
+    runtime_cfg,
+    worktree_root,
+    spec,
+    run_artifacts_dir,
+    obs,
+    docker_env,
+    sandbox_registry=None,
+    cancel_event: threading.Event | None = None,
+):
+    """Create sandbox + substrate for a single role, with retry.
+
+    If *sandbox_registry* is ``(dict, lock)`` the sandbox is registered
+    immediately after creation so the caller can close it even if this
+    future is later abandoned.
+    """
+    last_exc = None
+    for attempt in range(1, _SANDBOX_CREATE_MAX_ATTEMPTS + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise _SandboxInitCancelled(f"sandbox init cancelled for role '{role}'")
+        sandbox = None
+        try:
+            sandbox = build_sandbox(runtime_cfg=runtime_cfg, role=role, worktree_root=worktree_root)
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SandboxInitCancelled(f"sandbox init cancelled for role '{role}'")
+            if sandbox_registry is not None:
+                reg, lock = sandbox_registry
+                with lock:
+                    reg[role] = sandbox
+            substrate = LocalSubstrate(
+                role=role,
+                worktree_path=worktree_root,
+                spec=spec,
+                run_artifacts_dir=run_artifacts_dir,
+                observability=obs,
+                docker_env=docker_env,
+            )
+            return role, sandbox, substrate
+        except _SandboxInitCancelled:
+            if sandbox is not None:
+                try:
+                    sandbox.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if sandbox_registry is not None:
+                    reg, lock = sandbox_registry
+                    with lock:
+                        reg.pop(role, None)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if sandbox is not None:
+                try:
+                    sandbox.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if sandbox_registry is not None:
+                    reg, lock = sandbox_registry
+                    with lock:
+                        reg.pop(role, None)
+            if cancel_event is not None and cancel_event.is_set():
+                raise _SandboxInitCancelled(f"sandbox init cancelled for role '{role}'") from exc
+            if attempt < _SANDBOX_CREATE_MAX_ATTEMPTS:
+                backoff_sec = 2 ** attempt
+                if cancel_event is not None:
+                    if cancel_event.wait(timeout=backoff_sec):
+                        raise _SandboxInitCancelled(f"sandbox init cancelled for role '{role}'") from exc
+                else:
+                    time.sleep(backoff_sec)
+    raise last_exc
+
+
+_SANDBOX_CLOSE_TIMEOUT_SEC = 30
+
+
 def _close_sandboxes(sandboxes: Dict[str, Any]) -> None:
-    for sandbox in sandboxes.values():
+    def _safe_close(name: str, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[loopbench] warning: sandbox close failed for {name}: {exc}", file=sys.stderr)
+
+    for name, sandbox in sandboxes.items():
         close_fn = getattr(sandbox, "close", None)
-        if callable(close_fn):
+        if not callable(close_fn):
+            continue
+        t = threading.Thread(target=_safe_close, args=(name, close_fn), daemon=True)
+        t.start()
+        t.join(timeout=_SANDBOX_CLOSE_TIMEOUT_SEC)
+        if t.is_alive():
+            print(f"[loopbench] warning: sandbox close timed out for {name} after {_SANDBOX_CLOSE_TIMEOUT_SEC}s", file=sys.stderr)
+
+
+def _cancel_substrates(substrates: Dict[str, Any]) -> None:
+    for substrate in substrates.values():
+        cancel_fn = getattr(substrate, "cancel", None)
+        if callable(cancel_fn):
             try:
-                close_fn()
+                cancel_fn()
             except Exception:  # noqa: BLE001
                 pass
+
+
+_SUBSTRATE_TEARDOWN_TIMEOUT_SEC = 60
+
+
+def _teardown_substrates(substrates: Dict[str, Any]) -> None:
+    """Best-effort ``docker compose down`` on all substrates.
+
+    Runs teardowns in parallel threads so one slow teardown does not
+    block the others.  Errors are logged but never propagated.
+    """
+    threads: list[threading.Thread] = []
+    for name, substrate in substrates.items():
+        teardown_fn = getattr(substrate, "teardown", None)
+        if not callable(teardown_fn):
+            continue
+
+        def _do_teardown(n=name, fn=teardown_fn):
+            try:
+                fn(timeout_sec=_SUBSTRATE_TEARDOWN_TIMEOUT_SEC)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[loopbench] warning: substrate teardown failed for {n}: {exc}", file=sys.stderr)
+
+        t = threading.Thread(target=_do_teardown, daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=_SUBSTRATE_TEARDOWN_TIMEOUT_SEC + 10)

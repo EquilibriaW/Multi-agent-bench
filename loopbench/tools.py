@@ -6,6 +6,7 @@ ToolRouter implementation with budget checks and structured event logging.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from typing import Any, Dict, List
 
@@ -17,6 +18,76 @@ from .schema import Budget, ToolCall, ToolResult
 from .shell import run_command
 from .substrate import LocalSubstrate
 from .time_utils import now_ms
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)")
+
+
+def _fix_patch_hunk_counts(patch_text: str) -> str:
+    """Recalculate hunk header line counts in a unified diff.
+
+    LLMs frequently produce correct patch content but wrong ``@@`` line counts,
+    causing ``git apply`` to reject the patch as "corrupt".  This function
+    re-parses each hunk, counts actual old/new lines, and rewrites the header.
+    """
+    # Normalise: strip trailing newline so split() doesn't produce a ghost
+    # empty element, then re-add it at the end.
+    trailing_nl = patch_text.endswith("\n")
+    text = patch_text.rstrip("\n")
+    lines = text.split("\n")
+    out: list[str] = []
+    hunk_start_idx: int | None = None
+    hunk_lines: list[str] = []
+    old_start = new_start = 0
+    hunk_tail = ""
+
+    def _flush_hunk() -> None:
+        nonlocal hunk_start_idx, hunk_lines, old_start, new_start, hunk_tail
+        if hunk_start_idx is None:
+            return
+        old_count = 0
+        new_count = 0
+        for hl in hunk_lines:
+            if hl.startswith("-"):
+                old_count += 1
+            elif hl.startswith("+"):
+                new_count += 1
+            else:
+                # context line (space prefix) or empty-string representing blank context
+                old_count += 1
+                new_count += 1
+        header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{hunk_tail}"
+        out.append(header)
+        out.extend(hunk_lines)
+        hunk_start_idx = None
+        hunk_lines = []
+
+    for idx, line in enumerate(lines):
+        m = _HUNK_RE.match(line)
+        if m:
+            _flush_hunk()
+            old_start = int(m.group(1))
+            new_start = int(m.group(3))
+            hunk_tail = m.group(5) or ""
+            hunk_start_idx = idx
+            continue
+        if hunk_start_idx is not None:
+            # Inside a hunk — classify the line.
+            if line.startswith(("---", "+++")):
+                # Shouldn't happen mid-hunk, but treat as new file header.
+                _flush_hunk()
+                out.append(line)
+            else:
+                hunk_lines.append(line)
+            continue
+        # Outside any hunk — file header or other content.
+        out.append(line)
+
+    _flush_hunk()
+    result = "\n".join(out)
+    if trailing_nl:
+        result += "\n"
+    return result
 
 
 class DefaultToolRouter(ToolRouter):
@@ -100,6 +171,7 @@ class DefaultToolRouter(ToolRouter):
             patch_text = str(args["patch_text"])
             if patch_text and not patch_text.endswith("\n"):
                 patch_text = f"{patch_text}\n"
+            patch_text = _fix_patch_hunk_counts(patch_text)
             sandbox.apply_patch(patch_text)
             return self._ok(tool=tool, data={"bytes": len(patch_text.encode("utf-8"))})
 

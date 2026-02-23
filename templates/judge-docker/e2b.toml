@@ -1,0 +1,18 @@
+# This is a config for E2B sandbox template.
+# You can use template ID (3y9mwy5dj07vvs55ly8y) or template name (loopbench-judge-docker) to create a sandbox:
+
+# Python SDK
+# from e2b import Sandbox, AsyncSandbox
+# sandbox = Sandbox.create("loopbench-judge-docker") # Sync sandbox
+# sandbox = await AsyncSandbox.create("loopbench-judge-docker") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'e2b'
+# const sandbox = await Sandbox.create('loopbench-judge-docker')
+
+memory_mb = 2_048
+cpu_count = 2
+start_cmd = "/etc/e2b/start.sh"
+dockerfile = "e2b.Dockerfile"
+template_name = "loopbench-judge-docker"
+template_id = "3y9mwy5dj07vvs55ly8y"

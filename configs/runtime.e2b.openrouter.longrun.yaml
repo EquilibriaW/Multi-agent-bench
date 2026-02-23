@@ -23,11 +23,12 @@ env_runner:
     traces_endpoint: null
 
 judge:
-  kind: docker_container
-  image: ghcr.io/loopbench/judge:latest
+  kind: e2b_firecracker
+  e2b_template: loopbench-judge-docker
+  image: null
   network: none
   docker_host: null
-  buildx_config: .loopbench/docker_buildx
+  buildx_config: null
 
 storage:
   workspace_root: workspaces

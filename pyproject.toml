@@ -24,3 +24,4 @@ include = ["loopbench*"]
 
 [tool.uv.workspace]
 members = []
+exclude = ["runs/**", "workspaces/**", ".tmp/**"]

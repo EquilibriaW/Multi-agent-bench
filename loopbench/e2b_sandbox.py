@@ -8,6 +8,10 @@ and syncs state to/from an E2B sandbox for command execution isolation.
 """
 from __future__ import annotations
 
+import io
+import sys
+import tarfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 import shlex
@@ -18,6 +22,15 @@ from .path_utils import resolve_within_root
 from .schema import ToolResult
 from .shell import run_command, shell_quote
 from .time_utils import now_ms
+
+try:
+    from e2b.sandbox.commands.command_handle import CommandExitException as _CommandExitException
+except ImportError:
+    _CommandExitException = type(None)  # noqa: will never match if e2b not installed
+
+# Process-level registry of active E2B sandbox IDs for shutdown cleanup.
+_active_sandbox_ids: set[str] = set()
+_sandbox_registry_lock = threading.Lock()
 
 
 @dataclass
@@ -41,14 +54,12 @@ class E2BFirecrackerSandbox:
 
         try:
             from e2b_code_interpreter import Sandbox as E2BSandbox
-            from e2b.sandbox.filesystem.filesystem import FileType
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 "e2b backend requested but e2b-code-interpreter is not installed. "
                 "Install with: pip install e2b-code-interpreter"
             ) from exc
 
-        self._file_type = FileType
         create_kwargs: Dict[str, object] = {
             "timeout": options.timeout_sec,
             "allow_internet_access": options.allow_internet_access,
@@ -58,11 +69,36 @@ class E2BFirecrackerSandbox:
             create_kwargs["template"] = options.template
 
         self._sandbox = E2BSandbox.create(**create_kwargs)
+        with _sandbox_registry_lock:
+            _active_sandbox_ids.add(self._sandbox.sandbox_id)
         # E2B sandboxes run as an unprivileged user; top-level /workspace is not writable.
         self._remote_root = "/home/user/workspace"
 
-        self._run_remote(f"mkdir -p {shell_quote([self._remote_root])}", cwd=None)
-        self._sync_local_to_remote()
+        try:
+            self._run_remote(f"mkdir -p {shell_quote([self._remote_root])}", cwd=None)
+            self._sync_local_to_remote()
+            # Initialize a proper git repo in the remote workspace so that
+            # git commands work inside the sandbox.  The local worktree has a
+            # .git file (gitdir pointer) that references host paths unreachable
+            # from inside E2B; we exclude it from sync and create a fresh repo.
+            self._run_remote(
+                f"cd {shlex.quote(self._remote_root)} && "
+                "git init -q && "
+                "git config user.email 'loopbench@sandbox' && "
+                "git config user.name 'loopbench' && "
+                "git add -A && "
+                "git commit -q -m 'initial sync' --allow-empty",
+                cwd=self._remote_root,
+            )
+        except BaseException:
+            # If post-create setup fails, kill the E2B sandbox so it
+            # doesn't leak.  The caller never gets a reference to this
+            # object (the constructor raised), so nobody else can close it.
+            try:
+                self._sandbox.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
 
     def name(self) -> str:
         return self._sandbox_name
@@ -138,7 +174,11 @@ class E2BFirecrackerSandbox:
 
     def close(self) -> None:
         try:
+            sid = getattr(self._sandbox, "sandbox_id", None)
             self._sandbox.kill()
+            if sid:
+                with _sandbox_registry_lock:
+                    _active_sandbox_ids.discard(sid)
         except Exception:  # noqa: BLE001
             pass
 
@@ -152,88 +192,101 @@ class E2BFirecrackerSandbox:
 
     def _sync_local_to_remote(self) -> None:
         start = time.monotonic()
-        executable_paths: List[str] = []
-        for path in sorted(self.root.rglob("*")):
-            if path.is_symlink():
-                continue
-            # Guard against directory symlinks followed by rglob in
-            # Python < 3.13 — reject any resolved path outside root.
-            if not self._is_within_root(path):
-                continue
-            rel = path.relative_to(self.root)
-            remote_path = f"{self._remote_root}/{rel.as_posix()}"
+        # Create a tar archive of the local root in memory, upload it
+        # as a single blob, and extract on the remote side.  This
+        # replaces hundreds of individual file-write API calls with one
+        # write + one command, cutting sync time from minutes to seconds
+        # for large repos.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for path in sorted(self.root.rglob("*")):
+                if path.is_symlink():
+                    continue
+                if not self._is_within_root(path):
+                    continue
+                if not (path.is_file() or path.is_dir()):
+                    continue
+                rel = path.relative_to(self.root)
+                # Skip .git file/dir — the local worktree's .git has a gitdir
+                # pointer to host paths that don't exist inside E2B.  A fresh
+                # git repo is initialized on the remote side instead.
+                if rel.parts and rel.parts[0] == ".git":
+                    continue
+                # rglob already walks descendants; avoid recursively re-adding
+                # directory contents for every parent directory.
+                tar.add(str(path), arcname=rel.as_posix(), recursive=False)
+        tar_bytes = buf.getvalue()
 
-            if path.is_dir():
-                self._ensure_sync_budget(start=start, operation=f"mkdir {remote_path}")
-                self._files_make_dir(remote_path, request_timeout=self._file_request_timeout_sec)
-                continue
+        self._ensure_sync_budget(start=start, operation="upload tar")
+        remote_tar = "/tmp/.sync_upload.tar.gz"
+        upload_timeout = float(max(self._sync_budget_sec, self._file_request_timeout_sec))
+        self._files_write(remote_tar, tar_bytes, request_timeout=upload_timeout)
 
-            if not path.is_file():
-                continue
-
-            data = path.read_bytes()
-            self._ensure_sync_budget(start=start, operation=f"write {remote_path}")
-            self._files_write(remote_path, data, request_timeout=self._file_request_timeout_sec)
-            if path.stat().st_mode & 0o111:
-                executable_paths.append(remote_path)
-
-        for remote_path in executable_paths:
-            self._ensure_sync_budget(start=start, operation=f"chmod {remote_path}")
-            self._run_remote(f"chmod +x {shell_quote([remote_path])}", cwd=self._remote_root)
+        self._ensure_sync_budget(start=start, operation="extract tar")
+        extract_timeout = float(max(120, self._sync_budget_sec - (time.monotonic() - start)))
+        extract_result = self._commands_run(
+            f"tar xzf {shlex.quote(remote_tar)} -C {shlex.quote(self._remote_root)} && rm -f {shlex.quote(remote_tar)}",
+            cwd=self._remote_root,
+            timeout=extract_timeout,
+            request_timeout=extract_timeout + 30,
+        )
+        if extract_result.exit_code != 0 or extract_result.error:
+            raise RuntimeError(
+                f"e2b sync upload-extract failed: exit_code={extract_result.exit_code}; "
+                f"stderr={extract_result.stderr}; error={extract_result.error}"
+            )
 
     def _sync_remote_to_local(self) -> None:
         start = time.monotonic()
-        self._ensure_sync_budget(start=start, operation="list remote files")
-        entries = self._files_list(
-            self._remote_root,
-            depth=128,
-            request_timeout=self._control_request_timeout_sec,
+        # Tar the remote workspace into a single blob, download it,
+        # and extract locally.  Mirrors the tar-based upload approach.
+        remote_tar = "/tmp/.sync_download.tar.gz"
+        self._ensure_sync_budget(start=start, operation="create remote tar")
+        pack_timeout = float(max(120, self._sync_budget_sec - (time.monotonic() - start)))
+        pack_result = self._commands_run(
+            f"tar czf {shlex.quote(remote_tar)}"
+            f" --exclude=.git"
+            f" -C {shlex.quote(self._remote_root)} .",
+            cwd=self._remote_root,
+            timeout=pack_timeout,
+            request_timeout=pack_timeout + 30,
         )
-        self._ensure_sync_budget(start=start, operation="list remote files (post)")
+        if pack_result.exit_code != 0 or pack_result.error:
+            raise RuntimeError(
+                f"e2b sync download-pack failed: exit_code={pack_result.exit_code}; "
+                f"stderr={pack_result.stderr}; error={pack_result.error}"
+            )
 
-        remote_dirs = set()
-        remote_files = set()
+        self._ensure_sync_budget(start=start, operation="download tar")
+        download_timeout = float(max(self._sync_budget_sec, self._file_request_timeout_sec))
+        tar_bytes = bytes(self._files_read(
+            remote_tar,
+            format="bytes",
+            request_timeout=download_timeout,
+        ))
 
-        for entry in entries:
-            entry_path = str(entry.path)
-            if not entry_path.startswith(self._remote_root + "/"):
-                continue
-            rel = Path(entry_path[len(self._remote_root) + 1 :])
-            if not rel.parts:
-                continue
+        # Clean up remote tar.
+        try:
+            self._commands_run(
+                f"rm -f {shlex.quote(remote_tar)}",
+                cwd=self._remote_root,
+                timeout=10.0,
+                request_timeout=30.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
-            entry_type = entry.type
-            is_dir = entry_type == self._file_type.DIR or str(entry_type) == "dir"
-            is_file = entry_type == self._file_type.FILE or str(entry_type) == "file"
-
-            if is_dir:
-                remote_dirs.add(rel)
-            elif is_file:
-                remote_files.add(rel)
-
-        # Remove local files that no longer exist remotely.
+        # Replace local tree with remote contents.
+        # Remove existing files first, then extract.
         for path in sorted(self.root.rglob("*"), reverse=True):
-            if not path.is_file() or path.is_symlink():
-                continue
-            if not self._is_within_root(path):
-                continue
-            rel = path.relative_to(self.root)
-            if rel not in remote_files:
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+            elif path.is_file() and self._is_within_root(path):
                 path.unlink(missing_ok=True)
 
-        for rel in sorted(remote_dirs):
-            (self.root / rel).mkdir(parents=True, exist_ok=True)
-
-        for rel in sorted(remote_files):
-            local_path = self.root / rel
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            self._ensure_sync_budget(start=start, operation=f"read {rel.as_posix()}")
-            data = self._files_read(
-                f"{self._remote_root}/{rel.as_posix()}",
-                format="bytes",
-                request_timeout=self._file_request_timeout_sec,
-            )
-            local_path.write_bytes(bytes(data))
+        buf = io.BytesIO(tar_bytes)
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            tar.extractall(path=str(self.root))
 
     def _to_remote_dir(self, local_dir: Path) -> str:
         rel = local_dir.relative_to(self.root)
@@ -274,25 +327,18 @@ class E2BFirecrackerSandbox:
                 request_timeout=request_timeout,
             )
         except TypeError:
-            return self._sandbox.commands.run(command, cwd=cwd, timeout=timeout)
-
-    def _files_make_dir(self, path: str, *, request_timeout: float):
-        try:
-            return self._sandbox.files.make_dir(path, request_timeout=request_timeout)
-        except TypeError:
-            return self._sandbox.files.make_dir(path)
+            try:
+                return self._sandbox.commands.run(command, cwd=cwd, timeout=timeout)
+            except _CommandExitException as exc:
+                return exc  # CommandExitException is a CommandResult subclass
+        except _CommandExitException as exc:
+            return exc  # CommandExitException is a CommandResult subclass
 
     def _files_write(self, path: str, data: str | bytes, *, request_timeout: float):
         try:
             return self._sandbox.files.write(path, data, request_timeout=request_timeout)
         except TypeError:
             return self._sandbox.files.write(path, data)
-
-    def _files_list(self, path: str, *, depth: int, request_timeout: float):
-        try:
-            return self._sandbox.files.list(path, depth=depth, request_timeout=request_timeout)
-        except TypeError:
-            return self._sandbox.files.list(path, depth=depth)
 
     def _files_read(self, path: str, *, format: str, request_timeout: float):
         try:
@@ -325,3 +371,25 @@ class E2BFirecrackerSandbox:
         raise TimeoutError(
             f"e2b sync exceeded {self._sync_budget_sec:.1f}s while {operation}"
         )
+
+
+def kill_all_active_sandboxes() -> None:
+    """Kill all E2B sandboxes created by this process. For shutdown cleanup."""
+    with _sandbox_registry_lock:
+        ids = list(_active_sandbox_ids)
+    if not ids:
+        return
+    try:
+        from e2b_code_interpreter import Sandbox as E2BSandbox
+        for sid in ids:
+            try:
+                E2BSandbox.kill(sid)
+            except Exception:  # noqa: BLE001
+                pass
+        with _sandbox_registry_lock:
+            _active_sandbox_ids.difference_update(ids)
+        print(f"[loopbench] shutdown: killed {len(ids)} E2B sandbox(es)", file=sys.stderr)
+    except ImportError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loopbench] warning: E2B cleanup failed: {exc}", file=sys.stderr)

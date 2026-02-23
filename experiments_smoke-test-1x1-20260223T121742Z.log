@@ -1,0 +1,17 @@
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.11/bin/loopbench", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/Users/alex/Multi-agent-bench/loopbench/cli.py", line 123, in main
+    result = run_experiment(
+             ^^^^^^^^^^^^^^^
+  File "/Users/alex/Multi-agent-bench/loopbench/experiments.py", line 104, in run_experiment
+    _preflight_check_env_keys(spec, runtime_config_path_pre)
+  File "/Users/alex/Multi-agent-bench/loopbench/experiments.py", line 465, in _preflight_check_env_keys
+    raise RuntimeError(
+RuntimeError: Missing required environment variables — refusing to start experiment.
+  - OPEN_ROUTER_API_KEY (OpenRouter API key, referenced by lineup 'kimi2_5-team')
+Export them before launching:
+  export OPEN_ROUTER_API_KEY=sk-or-...
+  export E2B_API_KEY=e2b_...
+  export LANGSMITH_API_KEY=lsv2_...

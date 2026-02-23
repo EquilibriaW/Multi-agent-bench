@@ -1,0 +1,4 @@
+[loopbench] preflight: all required API keys present (OpenRouter, E2B=e2b_firecracker, tracing=langsmith)
+[loopbench] SIGTERM received, shutting down...
+[loopbench] shutdown: killed 1 E2B sandbox(es)
+Response 404

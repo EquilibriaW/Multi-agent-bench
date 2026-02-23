@@ -29,7 +29,7 @@ class SandboxBackendConfig(BaseModel):
         "unikernel",
         "local_process",
         "e2b_firecracker",
-    ] = "local_process"
+    ] = "e2b_firecracker"
     image: Optional[str] = None
     network: Optional[str] = None
     e2b: E2BBackendConfig = Field(default_factory=E2BBackendConfig)
@@ -38,7 +38,7 @@ class SandboxBackendConfig(BaseModel):
 class ObservabilityConfig(BaseModel):
     logs: str = "none"
     metrics: str = "none"
-    traces: str = "none"
+    traces: str = "langsmith"
     logs_endpoint: Optional[str] = None
     metrics_endpoint: Optional[str] = None
     traces_endpoint: Optional[str] = None
@@ -54,11 +54,12 @@ class EnvRunnerConfig(BaseModel):
 
 
 class JudgeRuntimeConfig(BaseModel):
-    kind: Literal["docker_container", "local_process"] = "local_process"
+    kind: Literal["docker_container", "local_process", "e2b_firecracker"] = "local_process"
     image: Optional[str] = None
     network: Optional[str] = None
     docker_host: Optional[str] = None
     buildx_config: Optional[str] = None
+    e2b_template: Optional[str] = None
 
 
 class StorageConfig(BaseModel):

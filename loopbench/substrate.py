@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -32,6 +33,7 @@ class LocalSubstrate:
         self.worktree_path = Path(worktree_path).resolve()
         self.spec = spec
         self.run_artifacts_dir = Path(run_artifacts_dir).resolve()
+        self._cancel_event = threading.Event()
         self.docker_env = self._build_docker_env(dict(docker_env or {}))
         self._last_status: Dict[str, Any] = {"state": "initialized"}
         self.observability = build_observability(
@@ -46,7 +48,13 @@ class LocalSubstrate:
         if not self.spec.up_cmd:
             self._last_status = {"state": "up_skipped", "reason": "no up_cmd configured"}
             return
-        result = run_shell(self.spec.up_cmd, cwd=self.worktree_path, timeout_sec=1800, env=self.docker_env)
+        result = run_shell(
+            self.spec.up_cmd,
+            cwd=self.worktree_path,
+            timeout_sec=1800,
+            env=self.docker_env,
+            cancel_event=self._cancel_event,
+        )
         self._write_artifact("env_up", result.stdout, result.stderr)
         self._last_status = {
             "state": "up_ok" if result.ok else "up_failed",
@@ -59,7 +67,13 @@ class LocalSubstrate:
         if not self.spec.down_cmd:
             self._last_status = {"state": "down_skipped", "reason": "no down_cmd configured"}
             return
-        result = run_shell(self.spec.down_cmd, cwd=self.worktree_path, timeout_sec=1800, env=self.docker_env)
+        result = run_shell(
+            self.spec.down_cmd,
+            cwd=self.worktree_path,
+            timeout_sec=1800,
+            env=self.docker_env,
+            cancel_event=self._cancel_event,
+        )
         self._write_artifact("env_down", result.stdout, result.stderr)
         self._last_status = {
             "state": "down_ok" if result.ok else "down_failed",
@@ -87,6 +101,7 @@ class LocalSubstrate:
             cwd=self.worktree_path,
             timeout_sec=1800,
             env=self.docker_env,
+            cancel_event=self._cancel_event,
         )
         self._write_artifact("public_validate", result.stdout, result.stderr)
         return ToolResult(
@@ -104,7 +119,13 @@ class LocalSubstrate:
             return "logs_tail unavailable: substrate is not compose"
 
         command = f"docker compose logs --tail {int(lines)} {service}"
-        result = run_shell(command, cwd=self.worktree_path, timeout_sec=120, env=self.docker_env)
+        result = run_shell(
+            command,
+            cwd=self.worktree_path,
+            timeout_sec=120,
+            env=self.docker_env,
+            cancel_event=self._cancel_event,
+        )
         if result.ok:
             return result.stdout
         return result.stderr or result.stdout
@@ -157,6 +178,28 @@ class LocalSubstrate:
         out_path = out_dir / f"{self.role}_{stem}.log"
         combined = f"STDOUT\n{stdout}\n\nSTDERR\n{stderr}\n"
         out_path.write_text(combined, encoding="utf-8")
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    def teardown(self, timeout_sec: int = 60) -> None:
+        """Best-effort teardown of Docker resources.
+
+        Unlike ``down()``, this uses a *fresh* cancel event so it still
+        works after ``cancel()`` has been called, and it swallows all
+        errors — suitable for ``finally`` blocks.
+        """
+        if not self.spec.down_cmd:
+            return
+        try:
+            run_shell(
+                self.spec.down_cmd,
+                cwd=self.worktree_path,
+                timeout_sec=timeout_sec,
+                env=self.docker_env,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _build_docker_env(self, base_env: Dict[str, str]) -> Dict[str, str]:
         env = dict(base_env)

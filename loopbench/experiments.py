@@ -5,10 +5,15 @@ Experiment runner for statistically meaningful benchmark rollouts.
 """
 from __future__ import annotations
 
+import logging
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import statistics
+import sys
+import threading
+import time as _time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,9 +23,16 @@ from typing import Any, Dict, List, Optional
 import yaml
 from pydantic import BaseModel, Field
 
+from .config import load_runtime_config
 from .controller import replay_events, run_benchmark
+from .e2b_sandbox import kill_all_active_sandboxes
 from .hidden_result import hidden_failure_reason, hidden_stderr_excerpt, normalize_error
 from .io_utils import read_yaml_mapping
+
+# Suppress noisy E2B SDK logging (prints "Response 404" on every
+# sandbox close/expiry, which pollutes experiment output).
+logging.getLogger("e2b").setLevel(logging.WARNING)
+logging.getLogger("e2b.api").setLevel(logging.WARNING)
 
 
 class LineupSpec(BaseModel):
@@ -87,6 +99,11 @@ def run_experiment(
     spec_path = Path(spec_path).resolve()
     spec = load_experiment_spec(spec_path)
 
+    # Hard preflight: fail fast if required env vars are missing.
+    runtime_config_path_pre = str((project_root / spec.runtime_config).resolve())
+    _preflight_check_env_keys(spec, runtime_config_path_pre)
+    _preflight_docker_cleanup()
+
     experiment_dir = project_root / "experiments" / spec.experiment_id
     if experiment_dir.exists():
         raise FileExistsError(f"experiment already exists: {experiment_dir}")
@@ -130,7 +147,23 @@ def run_experiment(
         raise ValueError("max_parallel_rollouts must be >= 1")
 
     max_workers = min(spec.max_parallel_rollouts, max(len(jobs), 1))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+
+    # SIGTERM handler: when `kill <pid>` is sent, set the shutdown
+    # event so in-flight rollouts cancel their harnesses, then stop
+    # the pool and exit into the finally block for cleanup.
+    _shutdown_event = threading.Event()
+    _prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _handle_sigterm(signum, frame):
+        _shutdown_event.set()
+        print("[loopbench] SIGTERM received, shutting down...", file=sys.stderr)
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    try:
         futures = []
         for job in jobs:
             futures.append(
@@ -147,13 +180,32 @@ def run_experiment(
                     project_root=project_root,
                     runs_root=runs_root,
                     allow_noop=allow_noop,
+                    shutdown_event=_shutdown_event,
                 )
             )
 
+        total_jobs = len(futures)
+        completed = 0
+        progress_start = _time.monotonic()
+
         for fut in as_completed(futures):
             record = fut.result()
+            completed += 1
+            elapsed = _time.monotonic() - progress_start
+            status_icon = "pass" if record.hidden_pass else ("INFRA" if record.status == "infra_error" else "fail")
+            wall_str = f" ({record.wall_clock_sec:.0f}s)" if record.wall_clock_sec else ""
+            print(
+                f"[loopbench] {completed}/{total_jobs} ({elapsed:.0f}s) "
+                f"{record.task_id} -> {status_icon}{wall_str}",
+                file=sys.stderr,
+            )
             records.append(record)
             _append_jsonl(results_path, asdict(record))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        signal.signal(signal.SIGTERM, _prev_sigterm)
+        if _shutdown_event.is_set():
+            kill_all_active_sandboxes()
 
     summary = _summarize_records(records)
     summary_payload = {
@@ -191,6 +243,7 @@ def _run_rollout_job(
     project_root: Path,
     runs_root: Path,
     allow_noop: bool,
+    shutdown_event: threading.Event | None = None,
 ) -> RolloutRecord:
     def make_record(**overrides: Any) -> RolloutRecord:
         payload: Dict[str, Any] = {
@@ -222,6 +275,9 @@ def _run_rollout_job(
         payload.update(overrides)
         return RolloutRecord(**payload)
 
+    if shutdown_event and shutdown_event.is_set():
+        return make_record(status="infra_error", failure_reason="shutdown requested")
+
     try:
         manifest = run_benchmark(
             task_dir=str(task_dir),
@@ -230,6 +286,7 @@ def _run_rollout_job(
             agents_config_path=agents_config_path,
             project_root=project_root,
             allow_noop=allow_noop,
+            shutdown_event=shutdown_event,
         )
         run_dir = runs_root / run_id
         try:
@@ -367,15 +424,140 @@ def _write_agents_config_for_lineup(*, experiment_dir: Path, lineup: LineupSpec)
     return path
 
 
+def _preflight_check_env_keys(spec: ExperimentSpec, runtime_config_path: str) -> None:
+    """Fail fast if required API keys are missing from the environment."""
+    import os as _os
+
+    missing: list[str] = []
+
+    # 1. OpenRouter key — check what the lineups reference
+    for lineup in spec.lineups:
+        key_env_name = lineup.role_env.get("OPENROUTER_API_KEY_ENV") or lineup.role_env.get("OPEN_ROUTER_API_KEY_ENV")
+        candidates = []
+        if isinstance(key_env_name, str) and key_env_name.strip():
+            candidates.append(key_env_name.strip())
+        for fallback in ("OPENROUTER_API_KEY", "OPEN_ROUTER_API_KEY"):
+            if fallback not in candidates:
+                candidates.append(fallback)
+        has_key = any((_os.environ.get(name) or "").strip() for name in candidates)
+        if key_env_name and not has_key:
+            missing.append(f"{key_env_name} (OpenRouter API key, referenced by lineup '{lineup.name}')")
+
+    # 2. E2B key — check if sandbox backend requires it
+    runtime_cfg = load_runtime_config(runtime_config_path)
+    if runtime_cfg.sandbox_backend.kind == "e2b_firecracker":
+        e2b_var = runtime_cfg.sandbox_backend.e2b.api_key_env
+        if not _os.environ.get(e2b_var):
+            missing.append(f"{e2b_var} (E2B sandbox API key)")
+
+    # 3. LangSmith key — check if tracing backend requires it
+    obs = runtime_cfg.env_runner.observability
+    if obs.traces.lower() == "langsmith":
+        has_ls = bool(
+            (_os.environ.get("LANGSMITH_API_KEY") or "").strip()
+            or (_os.environ.get("LANGCHAIN_API_KEY") or "").strip()
+        )
+        if not has_ls:
+            missing.append("LANGSMITH_API_KEY or LANGCHAIN_API_KEY (LangSmith tracing)")
+
+    if missing:
+        formatted = "\n  - ".join(missing)
+        raise RuntimeError(
+            f"Missing required environment variables — refusing to start experiment.\n"
+            f"  - {formatted}\n"
+            f"Export them before launching:\n"
+            f"  export OPEN_ROUTER_API_KEY=sk-or-...\n"
+            f"  export E2B_API_KEY=e2b_...\n"
+            f"  export LANGSMITH_API_KEY=lsv2_..."
+        )
+    print(
+        f"[loopbench] preflight: all required API keys present "
+        f"(OpenRouter, E2B={runtime_cfg.sandbox_backend.kind}, "
+        f"tracing={obs.traces})",
+        file=sys.stderr,
+    )
+
+
+def _preflight_docker_cleanup() -> None:
+    """Remove stale ``lb-*`` Docker resources from previous runs.
+
+    Previous experiments that were killed or crashed may leave behind
+    Docker containers (and their bridge networks).  These accumulate and
+    eventually exhaust the Docker network address pool, causing ``env.up``
+    to fail with "all predefined address pools have been fully subnetted".
+    """
+    import subprocess as _sp
+
+    try:
+        # Remove only non-running lb-* containers; active experiments may
+        # concurrently use the same prefix and must not be interrupted.
+        result = _sp.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=lb-",
+                "--format",
+                "{{.ID}} {{.State}}",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        container_ids: list[str] = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            cid, state = parts
+            if state in {"created", "exited", "dead"}:
+                container_ids.append(cid)
+        if container_ids:
+            _sp.run(
+                ["docker", "rm", "-f", *container_ids],
+                capture_output=True, text=True, timeout=60,
+            )
+            print(
+                f"[loopbench] preflight: removed {len(container_ids)} stale Docker container(s)",
+                file=sys.stderr,
+            )
+
+        # Prune now-orphaned lb-* networks.
+        result = _sp.run(
+            ["docker", "network", "ls", "--filter", "name=lb-", "--format", "{{.ID}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        network_ids = result.stdout.strip().split("\n") if result.stdout.strip() else []
+        removed = 0
+        for nid in network_ids:
+            r = _sp.run(
+                ["docker", "network", "rm", nid],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0:
+                removed += 1
+        if removed:
+            print(
+                f"[loopbench] preflight: removed {removed} stale Docker network(s)",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[loopbench] preflight: Docker cleanup skipped: {exc}", file=sys.stderr)
+
+
 def _build_run_id(experiment_id: str, lineup_name: str, task_id: str, rollout_index: int) -> str:
     base = f"{experiment_id}_{lineup_name}_{task_id}_r{rollout_index:02d}"
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base)
     return safe[:120]
 
 
+_jsonl_lock = threading.Lock()
+
+
 def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(obj, ensure_ascii=True) + "\n")
+    line = json.dumps(obj, ensure_ascii=True) + "\n"
+    with _jsonl_lock:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
 
 
 def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
@@ -427,11 +609,24 @@ def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
         pass_at_1_passes = sum(1 for r in first_rollouts if r.status == "ok" and r.hidden_pass is True)
         pass_at_1_infra = sum(1 for r in first_rollouts if r.status == "infra_error")
 
+        time_thresholds = [1200, 2400, 3600]
+        pass_at_1_by_time = {}
+        for threshold in time_thresholds:
+            passes_within = sum(
+                1 for r in first_rollouts
+                if r.status == "ok"
+                and r.hidden_pass is True
+                and r.wall_clock_sec is not None
+                and r.wall_clock_sec <= threshold
+            )
+            pass_at_1_by_time[f"pass_at_1_{threshold}s"] = _ratio(passes_within, pass_at_1_evaluable)
+
         summary[lineup] = {
             "n_rollouts": n,
             "n_evaluable": n_ok,
             "run_completion_rate": _ratio(n_ok, n),
             "pass_at_1": _ratio(pass_at_1_passes, pass_at_1_evaluable),
+            "pass_at_1_by_time": pass_at_1_by_time,
             "pass_at_1_infra_excluded": pass_at_1_infra,
             "hidden_pass_rate": _ratio(hidden_passes, n_ok),
             "public_pass_rate": _ratio(public_passes, n_ok),
@@ -534,6 +729,11 @@ def _classify_failure_text(text: Optional[str]) -> str:
 
     s = text.lower()
 
+    # Docker-specific: missing Dockerfile is an agent error (they were
+    # told to create it), not an infra path issue.
+    if "dockerfile" in s and ("no such file or directory" in s or "lstat" in s):
+        return "logic_errors"
+
     syntax_patterns = [
         "syntaxerror",
         "parse error",
@@ -598,6 +798,8 @@ def _is_timeout_text(text: Optional[str]) -> bool:
         "deadline exceeded",
         "wall clock",
         "max review rounds",
+        "budget exhausted",
+        "sync exceeded",
     ]
     return any(p in s for p in patterns)
 

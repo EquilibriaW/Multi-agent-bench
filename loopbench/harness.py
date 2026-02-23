@@ -369,6 +369,15 @@ class DeterministicHarness(MultiAgentHarness):
                 coder_roles=set(self.coders),
                 resolve_symbolic_commit=self._resolve_symbolic_commit_token,
             )
+            # Merge inspections reported by agentic tool loop (git_show/git_diff_files calls).
+            agentic_inspections = planner_result.output.get("inspected_commits", {})
+            if isinstance(agentic_inspections, dict):
+                for role_name, commit_list in agentic_inspections.items():
+                    if not isinstance(role_name, str):
+                        continue
+                    bucket = inspected_commits_by_role.setdefault(role_name, set())
+                    if isinstance(commit_list, (list, set)):
+                        bucket.update(str(c) for c in commit_list)
             force_rework = review_decision.request_rework
             structured_valid = bool(planner_result.output.get("openrouter_structured_valid", True))
             if not structured_valid:
@@ -1283,12 +1292,27 @@ class DeterministicHarness(MultiAgentHarness):
             context=context,
         )
         if result.ok:
-            result.output = self._materialize_role_actions(
-                role=role,
-                phase=phase,
-                context=context,
-                output=result.output,
-            )
+            exec_mode = (result.output or {}).get("execution_mode", "")
+            if exec_mode == "agentic_tool_loop":
+                # Agentic driver already applied changes directly to worktree.
+                # Auto-commit any uncommitted changes for coder roles.
+                if role != self.planner:
+                    commit_msg = (result.output or {}).get(
+                        "commit_message", f"{role}: {phase} update"
+                    )
+                    commit_sha = self._commit_role_if_dirty(
+                        role=role, commit_message=commit_msg
+                    )
+                    if commit_sha:
+                        result.output["commit"] = commit_sha
+                        result.output["changed"] = True
+            else:
+                result.output = self._materialize_role_actions(
+                    role=role,
+                    phase=phase,
+                    context=context,
+                    output=result.output,
+                )
 
         self.event_logger.log(
             "role_phase",

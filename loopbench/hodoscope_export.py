@@ -191,8 +191,13 @@ class TrajectoryExtractor:
                     elif isinstance(item, str):
                         parts.append(item)
                 text = "\n".join(parts)
+            elif isinstance(content, dict):
+                try:
+                    text = json.dumps(content, ensure_ascii=False, sort_keys=True)
+                except Exception:  # noqa: BLE001
+                    text = str(content)
             else:
-                text = str(content) if content else ""
+                text = str(content) if content is not None else ""
 
             text = _truncate(text, _MAX_CONTENT_CHARS)
 

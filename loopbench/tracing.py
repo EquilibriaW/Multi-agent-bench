@@ -28,6 +28,10 @@ _MAX_ERROR_CHARS = 1200
 _MAX_PROMPT_PREVIEW_CHARS = 24000
 _MAX_RESPONSE_PREVIEW_CHARS = 24000
 _MAX_CONTEXT_PREVIEW_CHARS = 12000
+_MAX_COMMUNICATION_ITEMS = 12
+_MAX_COMMUNICATION_ITEM_CHARS = 700
+_MAX_REVIEW_DIFF_VIEW_CHARS = 1800
+_MAX_REWRITE_PREVIEW_CHARS = 6000
 
 
 class NoopTraceSession:
@@ -190,15 +194,16 @@ class LangSmithTraceSession:
                 child = parent.create_child(
                     name=f"event.{event_type}",
                     run_type=_event_run_type(event_type),
-                    inputs={
-                        "event_type": event_type,
-                        "ts_ms": event.get("ts_ms"),
-                        "payload_json": _truncate_text(_to_json(payload), _MAX_EVENT_PAYLOAD_CHARS),
-                    },
+                    inputs=_event_inputs(event_type=event_type, ts_ms=event.get("ts_ms"), payload=payload),
                     tags=["loopbench_event", event_type],
                 )
                 child.post()
-                child.end(outputs={"recorded": True})
+                event_outputs: Dict[str, Any] = {"recorded": True}
+                if event_type == "role_phase" and isinstance(payload, dict):
+                    event_outputs["role"] = payload.get("role")
+                    event_outputs["phase"] = payload.get("phase")
+                    event_outputs["ok"] = payload.get("ok")
+                child.end(outputs=event_outputs)
                 child.patch()
 
                 if event_type == "role_phase":
@@ -256,21 +261,33 @@ class LangSmithTraceSession:
             return
 
         usage = usage_payload["usage"]
-        llm_inputs = {
-            "role": usage_payload["role"],
-            "phase": usage_payload["phase"],
-            "model": usage_payload["model"],
-            "attempt_count": usage_payload["attempt_count"],
-        }
-        llm_outputs = {
-            "structured_valid": usage_payload["structured_valid"],
-            "raw_chars": usage_payload["raw_chars"],
-        }
-
         role_io = _extract_role_phase_io(payload=payload, run_dir=self._run_dir)
-        if role_io:
-            llm_inputs.update(role_io.get("inputs") or {})
-            llm_outputs.update(role_io.get("outputs") or {})
+
+        io_inputs = role_io.get("inputs", {}) if role_io else {}
+        io_outputs = role_io.get("outputs", {}) if role_io else {}
+
+        # Use full messages array from OpenRouter request for LangSmith chat view
+        messages = io_inputs.get("messages", [])
+        llm_inputs: Dict[str, Any] = {"messages": messages}
+        for key in ("coordination_messages_preview", "review_diff_tool_preview"):
+            if key in io_inputs:
+                llm_inputs[key] = io_inputs[key]
+
+        # Build OpenAI-compatible choices array for LangSmith chat view
+        response_text = io_outputs.get("openrouter_response_preview", "")
+        llm_outputs: Dict[str, Any] = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": response_text,
+                    }
+                }
+            ]
+        }
+        for key in ("summary", "notes", "rewrite_preview", "review_diff_views_preview"):
+            if key in io_outputs:
+                llm_outputs[key] = io_outputs[key]
 
         parent = self._spans.get(span_id) if span_id else self._root
         if parent is None:
@@ -283,6 +300,41 @@ class LangSmithTraceSession:
             tags=["loopbench_llm", usage_payload["role"], usage_payload["phase"]],
         )
         llm_child.post()
+
+        # Move all debug/context data into metadata so chat view stays clean
+        span_metadata: Dict[str, Any] = {
+            "ls_provider": "openrouter",
+            "ls_model_name": usage_payload["model"],
+            "role": usage_payload["role"],
+            "phase": usage_payload["phase"],
+            "model": usage_payload["model"],
+            "attempt_count": usage_payload["attempt_count"],
+            "structured_valid": usage_payload["structured_valid"],
+            "raw_chars": usage_payload["raw_chars"],
+        }
+        for key in (
+            "artifact_paths",
+            "openrouter_request_preview",
+            "role_context_preview",
+            "coordination_messages_preview",
+            "review_diff_tool_preview",
+        ):
+            if key in io_inputs:
+                span_metadata[key] = io_inputs[key]
+        for key in (
+            "artifact_paths",
+            "openrouter_attempts_preview",
+            "applied_paths",
+            "commands_run",
+            "summary",
+            "notes",
+            "rewrite_preview",
+            "review_diff_views_preview",
+        ):
+            if key in io_outputs:
+                span_metadata[key] = io_outputs[key]
+
+        llm_child.add_metadata(span_metadata)
         llm_child.set(usage_metadata=usage)
         llm_child.end(outputs=llm_child.outputs or {})
         llm_child.patch()
@@ -383,11 +435,31 @@ def _event_run_type(event_type: str) -> str:
     return "chain"
 
 
+def _event_inputs(*, event_type: str, ts_ms: Any, payload: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"event_type": event_type, "ts_ms": ts_ms}
+    payload_json = _to_json(payload)
+    if len(payload_json) <= _MAX_EVENT_PAYLOAD_CHARS:
+        try:
+            out["payload"] = json.loads(payload_json)
+            return out
+        except Exception:  # noqa: BLE001
+            pass
+    out["payload_json"] = _truncate_text(payload_json, _MAX_EVENT_PAYLOAD_CHARS)
+    return out
+
+
 def _to_json(payload: Any) -> str:
     try:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     except Exception:  # noqa: BLE001
         return json.dumps(repr(payload), ensure_ascii=False)
+
+
+def _to_pretty_json(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+    except Exception:  # noqa: BLE001
+        return _to_json(payload)
 
 
 def _truncate_text(value: Optional[str], max_chars: int) -> str:
@@ -407,7 +479,9 @@ def _extract_role_phase_usage(payload: Any) -> Optional[Dict[str, Any]]:
 
     usage = _normalize_usage_metadata(output.get("openrouter_usage"))
     if usage is None:
-        return None
+        usage = _normalize_usage_metadata(output.get("usage"))
+    if usage is None:
+        usage = _zero_usage_metadata()
 
     role = str(payload.get("role") or "unknown")
     phase = str(payload.get("phase") or "unknown")
@@ -467,6 +541,12 @@ def _extract_role_phase_io(payload: Any, run_dir: Path | None) -> Dict[str, Any]
                 _to_json(context_json),
                 _MAX_CONTEXT_PREVIEW_CHARS,
             )
+            coordination_messages = _summarize_coordination_messages(context_json.get("implementation_messages"))
+            if coordination_messages:
+                out["inputs"]["coordination_messages_preview"] = coordination_messages
+            review_diff_tool_preview = _summarize_review_diff_tool(context_json.get("review_diff_tool"))
+            if review_diff_tool_preview:
+                out["inputs"]["review_diff_tool_preview"] = review_diff_tool_preview
 
     if response_path:
         response_text = _load_text_artifact(run_dir=run_dir, artifact_path=response_path)
@@ -490,6 +570,12 @@ def _extract_role_phase_io(payload: Any, run_dir: Path | None) -> Dict[str, Any]
     commands_run = output.get("commands_run")
     if isinstance(commands_run, list):
         out["outputs"]["commands_run"] = commands_run[:20]
+        review_diff_views = _summarize_review_diff_views(commands_run)
+        if review_diff_views:
+            out["outputs"]["review_diff_views_preview"] = review_diff_views
+    rewrite_preview = _extract_rewrite_preview(output)
+    if rewrite_preview:
+        out["outputs"]["rewrite_preview"] = rewrite_preview
     summary = output.get("summary")
     if isinstance(summary, str) and summary.strip():
         out["outputs"]["summary"] = summary.strip()
@@ -500,35 +586,148 @@ def _extract_role_phase_io(payload: Any, run_dir: Path | None) -> Dict[str, Any]
     return out
 
 
-def _extract_chat_messages(payload: Dict[str, Any]) -> Dict[str, str]:
+def _extract_chat_messages(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract all chat messages from an OpenRouter request payload.
+
+    Returns ``{"messages": [{"role": ..., "content": ...}, ...]}`` with each
+    message's content individually truncated.  An empty dict is returned when
+    no messages are found.
+    """
     messages = payload.get("messages")
     if not isinstance(messages, list):
         return {}
 
-    system_prompt = ""
-    user_prompt = ""
+    out_messages: list[Dict[str, str]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").strip().lower()
+        if not role:
+            continue
         content = message.get("content")
         if isinstance(content, str):
             value = content
         else:
-            value = _to_json(content)
-        if role == "system" and not system_prompt:
-            system_prompt = _truncate_text(value, _MAX_PROMPT_PREVIEW_CHARS)
-        if role == "user" and not user_prompt:
-            user_prompt = _truncate_text(value, _MAX_PROMPT_PREVIEW_CHARS)
-        if system_prompt and user_prompt:
-            break
+            value = _to_pretty_json(content)
+        out_messages.append({
+            "role": role,
+            "content": _truncate_text(value, _MAX_PROMPT_PREVIEW_CHARS),
+        })
 
+    if not out_messages:
+        return {}
+    return {"messages": out_messages}
+
+
+def _summarize_coordination_messages(raw_messages: Any) -> list[str]:
+    if not isinstance(raw_messages, list):
+        return []
+    lines: list[str] = []
+    for message in raw_messages[-_MAX_COMMUNICATION_ITEMS:]:
+        if not isinstance(message, dict):
+            continue
+        from_role = str(message.get("from_role") or "unknown")
+        to_role = str(message.get("to_role") or "*")
+        kind = str(message.get("kind") or "message")
+        body_preview = _message_body_preview(message.get("body"))
+        line = f"{from_role} -> {to_role} [{kind}]"
+        if body_preview:
+            line = f"{line}: {body_preview}"
+        lines.append(_truncate_text(line, _MAX_COMMUNICATION_ITEM_CHARS))
+    return lines
+
+
+def _message_body_preview(body: Any) -> str:
+    if isinstance(body, str):
+        return body.strip()
+    if isinstance(body, dict):
+        for key in (
+            "summary",
+            "planner_feedback",
+            "error",
+            "message",
+            "status",
+            "title",
+            "task_id",
+            "reason",
+        ):
+            value = body.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{key}={value.strip()}"
+        return _truncate_text(_to_json(body), _MAX_COMMUNICATION_ITEM_CHARS)
+    if body is None:
+        return ""
+    return _truncate_text(str(body), _MAX_COMMUNICATION_ITEM_CHARS)
+
+
+def _summarize_review_diff_tool(raw_tool: Any) -> Dict[str, str]:
+    if not isinstance(raw_tool, dict):
+        return {}
+    commands = raw_tool.get("commands")
+    if not isinstance(commands, dict):
+        return {}
     out: Dict[str, str] = {}
-    if system_prompt:
-        out["system_prompt"] = system_prompt
-    if user_prompt:
-        out["user_prompt"] = user_prompt
+    for key in ("list", "show", "files"):
+        value = commands.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = _truncate_text(value.strip(), _MAX_COMMUNICATION_ITEM_CHARS)
     return out
+
+
+def _summarize_review_diff_views(commands_run: list[Any]) -> list[Dict[str, Any]]:
+    out: list[Dict[str, Any]] = []
+    for item in commands_run[:20]:
+        if not isinstance(item, dict):
+            continue
+        cmd = str(item.get("cmd") or "").strip()
+        if "review_diff_tool.py" not in cmd:
+            continue
+        preview = ""
+        stdout_tail = item.get("stdout_tail")
+        stderr_tail = item.get("stderr_tail")
+        if isinstance(stdout_tail, str) and stdout_tail.strip():
+            preview = stdout_tail.strip()
+        elif isinstance(stderr_tail, str) and stderr_tail.strip():
+            preview = stderr_tail.strip()
+        out.append(
+            {
+                "cmd": _truncate_text(cmd, _MAX_COMMUNICATION_ITEM_CHARS),
+                "ok": bool(item.get("ok")),
+                "exit_code": item.get("exit_code"),
+                "preview": _truncate_text(preview, _MAX_REVIEW_DIFF_VIEW_CHARS),
+            }
+        )
+    return out
+
+
+def _extract_rewrite_preview(output: Dict[str, Any]) -> str:
+    for key in ("intent_patch", "patch"):
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return _truncate_text(value.strip(), _MAX_REWRITE_PREVIEW_CHARS)
+
+    previews: list[str] = []
+    for key in ("intent_file_updates", "file_updates"):
+        updates = output.get(key)
+        if not isinstance(updates, list):
+            continue
+        for update in updates[:3]:
+            if not isinstance(update, dict):
+                continue
+            path = str(update.get("path") or "").strip()
+            content = update.get("content")
+            if not isinstance(content, str):
+                continue
+            header = f"--- {path}" if path else "--- file update"
+            previews.append(f"{header}\n{_truncate_text(content.strip(), 1200)}")
+    if previews:
+        return _truncate_text("\n\n".join(previews), _MAX_REWRITE_PREVIEW_CHARS)
+    notes = output.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        notes_text = notes.strip()
+        if "```diff" in notes_text or "diff --git" in notes_text:
+            return _truncate_text(notes_text, _MAX_REWRITE_PREVIEW_CHARS)
+    return ""
 
 
 def _find_artifact_path(artifact_paths: Dict[str, Any], suffix: str) -> Optional[str]:
@@ -574,6 +773,14 @@ def _resolve_artifact_path(*, run_dir: Path, artifact_path: str) -> Optional[Pat
     return None
 
 
+def _zero_usage_metadata() -> Dict[str, int]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
 def _normalize_usage_metadata(raw: Any) -> Optional[Dict[str, int]]:
     if not isinstance(raw, dict):
         return None
@@ -583,8 +790,6 @@ def _normalize_usage_metadata(raw: Any) -> Optional[Dict[str, int]]:
     total_tokens = _read_non_negative_int(raw.get("total_tokens"))
     if total_tokens <= 0:
         total_tokens = input_tokens + output_tokens
-    if total_tokens <= 0:
-        return None
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
