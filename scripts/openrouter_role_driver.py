@@ -316,6 +316,12 @@ def _build_payload(
         "coordination_summary",
         "review_diff_tool",
         "knowledge_tool",
+        # Reflection-phase context (populated by harness._run_reflection)
+        "validation_result",
+        "review_decision_summary",
+        "coder_output_summaries",
+        "merged_commits_this_round",
+        "current_knowledge",
     )
     user_prompt = {
         "role": role,

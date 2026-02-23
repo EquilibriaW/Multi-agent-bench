@@ -147,6 +147,7 @@ def run_benchmark(
             base_commit=run_paths.base_commit,
             max_review_rounds=agents_cfg.scheduling.max_review_rounds,
             event_logger=event_logger,
+            reflection_enabled=agents_cfg.scheduling.reflection_enabled,
         )
 
         # Optionally bring up planner substrate once before orchestration.

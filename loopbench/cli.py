@@ -115,7 +115,7 @@ def main() -> None:
             allow_noop=args.allow_noop,
         )
         console.print("[green]experiment complete[/green]")
-        console.print(json.dumps(result, indent=2))
+        console.print(json.dumps(result, indent=2), highlight=False, markup=False)
         return
 
     if args.cmd == "preflight":
