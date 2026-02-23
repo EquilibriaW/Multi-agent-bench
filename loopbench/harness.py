@@ -171,6 +171,7 @@ class DeterministicHarness(MultiAgentHarness):
         self.artifacts.append_status(f"coordination initialized: sqlite at {self.team.db_path}")
 
     def _bootstrap_phase(self, task: TaskPack, state: HarnessState) -> None:
+        self.event_logger.begin_span("bootstrap", name="phase.bootstrap", tags=["phase", "bootstrap"])
         context = {
             "task_id": task.task_id,
             "task_kind": task.kind,
@@ -181,7 +182,7 @@ class DeterministicHarness(MultiAgentHarness):
             "coordination_db_path": str(self.team.db_path),
             "coordination": {"protocol": "sqlite", "db_path": str(self.team.db_path)},
         }
-        result = self._invoke_role(self.planner, "bootstrap", context, raise_on_failure=False)
+        result = self._invoke_role(self.planner, "bootstrap", context, raise_on_failure=False, span_id="bootstrap")
         state.role_outputs[f"{self.planner}:bootstrap"] = result.output
         self.artifacts.write_role_summary(
             role=self.planner,
@@ -248,8 +249,10 @@ class DeterministicHarness(MultiAgentHarness):
         self.artifacts.append_status(
             f"bootstrap finished: plan + subtasks written, seeded implementation tasks={seeded_count}"
         )
+        self.event_logger.end_span("bootstrap")
 
     def _implementation_phase(self, task: TaskPack, state: HarnessState) -> None:
+        self.event_logger.begin_span("implementation", name="phase.implementation", tags=["phase", "implementation"])
         planner_summary = self.artifacts.read_text(self.run_dir / "plans" / "plan.md")
         phase_results = self._run_parallel_claim_phase(
             task=task,
@@ -259,11 +262,13 @@ class DeterministicHarness(MultiAgentHarness):
             planner_summary=planner_summary,
             round_index=None,
             extra_context={},
+            parent_span_id="implementation",
         )
         self._record_worker_phase_outcomes(
             label="implementation phase",
             phase_results=phase_results,
         )
+        self.event_logger.end_span("implementation")
 
     def _review_phase(self, task: TaskPack, state: HarnessState, tools) -> bool:
         public_policy = public_validate_policy(getattr(task.substrate, "public_validate_policy", None))
@@ -276,6 +281,12 @@ class DeterministicHarness(MultiAgentHarness):
 
         for round_index in range(1, self.max_review_rounds + 1):
             state.review_round = round_index
+            round_span = f"review_round_{round_index}"
+            self.event_logger.begin_span(
+                round_span,
+                name=f"review.round_{round_index}",
+                tags=["review", f"round_{round_index}"],
+            )
             self.artifacts.append_status(f"review round {round_index} started")
 
             planner_context: Dict[str, Any] = {
@@ -320,12 +331,21 @@ class DeterministicHarness(MultiAgentHarness):
                 round_index=round_index,
                 candidate_merge_commits=planner_context["candidate_merge_commits"],
             )
+            review_select_span = f"review_select_{round_index}"
+            self.event_logger.begin_span(
+                review_select_span,
+                parent_span_id=round_span,
+                name=f"step.review_select",
+                tags=["step", "review_select"],
+            )
             planner_result = self._invoke_role(
                 self.planner,
                 "review",
                 planner_context,
                 raise_on_failure=False,
+                span_id=review_select_span,
             )
+            self.event_logger.end_span(review_select_span)
             state.role_outputs[f"{self.planner}:review:{round_index}"] = planner_result.output
             self.artifacts.write_role_summary(
                 role=self.planner,
@@ -420,6 +440,13 @@ class DeterministicHarness(MultiAgentHarness):
                 + ", ".join(f"{coder}={count}" for coder, count in nominated_counts.items())
             )
 
+            merge_span = f"merge_{round_index}"
+            self.event_logger.begin_span(
+                merge_span,
+                parent_span_id=round_span,
+                name="step.merge",
+                tags=["step", "merge"],
+            )
             merged_before_by_role = {
                 coder: set(state.merged_commits[coder])
                 for coder in self.coders
@@ -442,7 +469,16 @@ class DeterministicHarness(MultiAgentHarness):
                 self.artifacts.append_open_question(
                     f"merge conflict encountered in review round {round_index}"
                 )
+            self.event_logger.end_span(merge_span)
 
+            validate_span = f"validate_{round_index}"
+            self.event_logger.begin_span(
+                validate_span,
+                parent_span_id=round_span,
+                name="step.public_validate",
+                run_type="tool",
+                tags=["step", "public_validate"],
+            )
             validation_summary = self._run_public_validation_round(
                 round_index=round_index,
                 task=task,
@@ -453,6 +489,7 @@ class DeterministicHarness(MultiAgentHarness):
             last_validation = validation_summary.last_validation
             public_validation_passed = validation_summary.passed
             public_validation_available = validation_summary.available
+            self.event_logger.end_span(validate_span)
 
             if not merge_ok:
                 force_rework = True
@@ -480,6 +517,13 @@ class DeterministicHarness(MultiAgentHarness):
                 )
 
             if not force_rework:
+                verify_span = f"verify_{round_index}"
+                self.event_logger.begin_span(
+                    verify_span,
+                    parent_span_id=round_span,
+                    name="step.review_verify",
+                    tags=["step", "review_verify"],
+                )
                 verify_decision = self._run_review_verify(
                     task=task,
                     round_index=round_index,
@@ -487,7 +531,9 @@ class DeterministicHarness(MultiAgentHarness):
                     last_validation=last_validation,
                     candidate_merge_commits=planner_context["candidate_merge_commits"],
                     review_diff_tool=planner_context["review_diff_tool"],
+                    span_id=verify_span,
                 )
+                self.event_logger.end_span(verify_span)
                 if verify_decision.request_rework:
                     force_rework = True
                 if verify_decision.coder_feedback:
@@ -497,6 +543,13 @@ class DeterministicHarness(MultiAgentHarness):
 
             # --- Reflection phase (LLM-driven knowledge distillation) ---
             if self.knowledge is not None:
+                reflect_span = f"reflect_{round_index}"
+                self.event_logger.begin_span(
+                    reflect_span,
+                    parent_span_id=round_span,
+                    name="step.reflect",
+                    tags=["step", "reflect"],
+                )
                 self._run_reflection(
                     task=task,
                     round_index=round_index,
@@ -504,7 +557,9 @@ class DeterministicHarness(MultiAgentHarness):
                     last_validation=last_validation,
                     review_decision=review_decision,
                     merged_commits_this_round=merged_commits_this_round,
+                    span_id=reflect_span,
                 )
+                self.event_logger.end_span(reflect_span)
 
             verify_output = state.role_outputs.get(
                 f"{self.planner}:review_verify:{round_index}",
@@ -537,6 +592,7 @@ class DeterministicHarness(MultiAgentHarness):
                 )
                 if public_validation_passed:
                     accepted_public_pass = True
+                self.event_logger.end_span(round_span)
                 break
 
             if not merged_commits_added and not review_decision.coder_feedback:
@@ -554,7 +610,16 @@ class DeterministicHarness(MultiAgentHarness):
                     accepted=False,
                     force_rework=True,
                 )
-                self._request_rework_from_coders(**rework_kwargs)
+                rework_span = f"rework_{round_index}"
+                self.event_logger.begin_span(
+                    rework_span,
+                    parent_span_id=round_span,
+                    name="step.rework",
+                    tags=["step", "rework"],
+                )
+                self._request_rework_from_coders(**rework_kwargs, parent_span_id=rework_span)
+                self.event_logger.end_span(rework_span)
+                self.event_logger.end_span(round_span)
                 continue
 
             if public_policy == "required" and not public_validation_passed:
@@ -580,7 +645,16 @@ class DeterministicHarness(MultiAgentHarness):
                 force_rework=True,
             )
 
-            self._request_rework_from_coders(**rework_kwargs)
+            rework_span = f"rework_{round_index}"
+            self.event_logger.begin_span(
+                rework_span,
+                parent_span_id=round_span,
+                name="step.rework",
+                tags=["step", "rework"],
+            )
+            self._request_rework_from_coders(**rework_kwargs, parent_span_id=rework_span)
+            self.event_logger.end_span(rework_span)
+            self.event_logger.end_span(round_span)
 
         return accepted_public_pass
 
@@ -593,6 +667,7 @@ class DeterministicHarness(MultiAgentHarness):
         last_validation: PublicValidationRecord,
         candidate_merge_commits: Dict[str, List[Dict[str, Any]]],
         review_diff_tool: Dict[str, Any],
+        span_id: str | None = None,
     ) -> ReviewDecision:
         verify_context: Dict[str, Any] = {
             "task_id": task.task_id,
@@ -620,6 +695,7 @@ class DeterministicHarness(MultiAgentHarness):
             "review_verify",
             verify_context,
             raise_on_failure=False,
+            span_id=span_id,
         )
         state.role_outputs[f"{self.planner}:review_verify:{round_index}"] = verify_result.output
         self.artifacts.write_role_summary(
@@ -763,6 +839,7 @@ class DeterministicHarness(MultiAgentHarness):
         return summary
 
     def _finalize_phase(self, task: TaskPack, state: HarnessState) -> Path:
+        self.event_logger.begin_span("finalize", name="phase.finalize", tags=["phase", "finalize"])
         context = {
             "task_id": task.task_id,
             "phase": "finalize",
@@ -774,7 +851,7 @@ class DeterministicHarness(MultiAgentHarness):
             },
             "coordination_db_path": str(self.team.db_path),
         }
-        result = self._invoke_role(self.planner, "finalize", context, raise_on_failure=False)
+        result = self._invoke_role(self.planner, "finalize", context, raise_on_failure=False, span_id="finalize")
         state.role_outputs[f"{self.planner}:finalize"] = result.output
         self.artifacts.write_role_summary(role=self.planner, phase="finalize", result=result)
         if not result.ok:
@@ -797,6 +874,7 @@ class DeterministicHarness(MultiAgentHarness):
         )
         ensure_success(diff_result, "git diff final patch")
         final_patch.write_text(diff_result.stdout, encoding="utf-8")
+        self.event_logger.end_span("finalize")
         return final_patch
 
     def _request_rework_from_coders(
@@ -807,6 +885,7 @@ class DeterministicHarness(MultiAgentHarness):
         validation_stderr: str,
         state: HarnessState,
         planner_feedback_by_role: Optional[Dict[str, str]] = None,
+        parent_span_id: str | None = None,
     ) -> None:
         rework_seed = self.team.seed_rework(
             round_index=round_index,
@@ -828,6 +907,7 @@ class DeterministicHarness(MultiAgentHarness):
                 validation_stderr=validation_stderr,
                 planner_feedback_by_role=planner_feedback_by_role,
             ),
+            parent_span_id=parent_span_id,
         )
         self._record_worker_phase_outcomes(
             label=f"rework round {round_index}",
@@ -854,10 +934,10 @@ class DeterministicHarness(MultiAgentHarness):
             directive = self.knowledge.directive()
             if directive:
                 ctx["reflection_directive"] = directive
-            ctx["knowledge_tool"] = build_knowledge_tool_context(
-                role_path=self.role_paths[self.planner],
-                knowledge_dir=self.run_dir / "knowledge",
-            )
+            # NOTE: knowledge_tool is NOT injected here because extra_context
+            # is shared across all coders.  It is injected per-role inside
+            # _run_claimed_task so that the script is deployed into each
+            # coder's own worktree.
         return ctx
 
     def _run_reflection(
@@ -869,6 +949,7 @@ class DeterministicHarness(MultiAgentHarness):
         last_validation: "PublicValidationRecord",
         review_decision: "ReviewDecision",
         merged_commits_this_round: Dict[str, List[str]],
+        span_id: str | None = None,
     ) -> None:
         """Invoke the planner driver with phase='reflect' to distill knowledge."""
         assert self.knowledge is not None
@@ -912,6 +993,7 @@ class DeterministicHarness(MultiAgentHarness):
             "reflect",
             reflection_context,
             raise_on_failure=False,
+            span_id=span_id,
         )
         state.role_outputs[f"{self.planner}:reflect:{round_index}"] = result.output
         self.artifacts.write_role_summary(
@@ -945,6 +1027,7 @@ class DeterministicHarness(MultiAgentHarness):
         planner_summary: str,
         round_index: Optional[int],
         extra_context: Dict[str, Any],
+        parent_span_id: str | None = None,
     ) -> Dict[str, WorkerPhaseOutcome]:
         if not self.coders:
             return {}
@@ -961,6 +1044,7 @@ class DeterministicHarness(MultiAgentHarness):
                     planner_summary=planner_summary,
                     round_index=round_index,
                     extra_context=extra_context,
+                    parent_span_id=parent_span_id,
                 ): coder
                 for coder in self.coders
             }
@@ -988,6 +1072,7 @@ class DeterministicHarness(MultiAgentHarness):
         planner_summary: str,
         round_index: Optional[int],
         extra_context: Dict[str, Any],
+        parent_span_id: str | None = None,
     ) -> WorkerPhaseOutcome:
         outcome = WorkerPhaseOutcome(role=role)
 
@@ -1014,6 +1099,7 @@ class DeterministicHarness(MultiAgentHarness):
                     planner_summary=planner_summary,
                     round_index=round_index,
                     extra_context=extra_context,
+                    parent_span_id=parent_span_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 outcome.failed += 1
@@ -1094,6 +1180,7 @@ class DeterministicHarness(MultiAgentHarness):
         planner_summary: str,
         round_index: Optional[int],
         extra_context: Dict[str, Any],
+        parent_span_id: str | None = None,
     ) -> RoleRunResult:
         context = {
             "task_id": task.task_id,
@@ -1120,7 +1207,14 @@ class DeterministicHarness(MultiAgentHarness):
             },
         }
         context.update(extra_context)
-        return self._invoke_role(role, driver_phase, context, raise_on_failure=False)
+        # Deploy knowledge_tool into the executing role's worktree so the
+        # advertised command path resolves correctly for each coder.
+        if self.knowledge is not None:
+            context["knowledge_tool"] = build_knowledge_tool_context(
+                role_path=self.role_paths[role],
+                knowledge_dir=self.run_dir / "knowledge",
+            )
+        return self._invoke_role(role, driver_phase, context, raise_on_failure=False, span_id=parent_span_id)
 
     def _merge_new_commits(
         self,
@@ -1178,6 +1272,7 @@ class DeterministicHarness(MultiAgentHarness):
         context: Dict[str, Any],
         *,
         raise_on_failure: bool = True,
+        span_id: str | None = None,
     ) -> RoleRunResult:
         driver = self.role_drivers[role]
         result = driver.run_phase(
@@ -1206,6 +1301,7 @@ class DeterministicHarness(MultiAgentHarness):
                 "stderr": result.stderr[-4000:],
                 "output": result.output,
             },
+            span_id=span_id,
         )
 
         if not result.ok and raise_on_failure:

@@ -419,10 +419,16 @@ def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
                 continue
             pressure_index.append(r.review_iterations + r.merge_conflicts + r.env_cycles_used)
 
+        # pass@1: first-attempt success rate per task (ABC bench compatible)
+        first_rollouts = [r for r in recs if r.rollout_index == 1]
+        pass_at_1_ok = sum(1 for r in first_rollouts if r.status == "ok")
+        pass_at_1_passes = sum(1 for r in first_rollouts if r.status == "ok" and r.hidden_pass is True)
+
         summary[lineup] = {
             "n_rollouts": n,
             "n_evaluable": n_ok,
             "run_completion_rate": _ratio(n_ok, n),
+            "pass_at_1": _ratio(pass_at_1_passes, pass_at_1_ok),
             "hidden_pass_rate": _ratio(hidden_passes, n_ok),
             "public_pass_rate": _ratio(public_passes, n_ok),
             "median_wall_clock_sec": _median_or_none(wall),
@@ -463,7 +469,8 @@ def _render_feedback(summary_payload: Dict[str, Any], records: List[RolloutRecor
     lines.append("## Lineup Summary")
     for lineup, metrics in summary_payload["summary"].items():
         lines.append(
-            f"- {lineup}: hidden_pass_rate={metrics['hidden_pass_rate']:.3f}, "
+            f"- {lineup}: pass@1={metrics['pass_at_1']:.1%}, "
+            f"hidden_pass_rate={metrics['hidden_pass_rate']:.3f}, "
             f"run_completion_rate={metrics['run_completion_rate']:.3f}, "
             f"coordination_pressure_index_mean={metrics['coordination_pressure_index_mean']}, "
             f"mean_coordination_messages_total={metrics['mean_coordination_messages_total']}"

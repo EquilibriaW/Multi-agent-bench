@@ -36,8 +36,23 @@ class NoopTraceSession:
         self.backend = backend
         self._reason = reason
 
-    def emit_event(self, event: Dict[str, Any]) -> None:
+    def emit_event(self, event: Dict[str, Any], *, span_id: Optional[str] = None) -> None:
         _ = event
+
+    def begin_span(
+        self,
+        span_id: str,
+        *,
+        parent_span_id: Optional[str] = None,
+        name: str = "",
+        run_type: str = "chain",
+        inputs: Optional[Dict[str, Any]] = None,
+        tags: Optional[list[str]] = None,
+    ) -> None:
+        pass
+
+    def end_span(self, span_id: str, *, outputs: Optional[Dict[str, Any]] = None) -> None:
+        pass
 
     def finish(self, *, outputs: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> None:
         _ = outputs
@@ -116,8 +131,49 @@ class LangSmithTraceSession:
             }
         )
         self._root.post()
+        self._spans: Dict[str, Any] = {}  # span_id -> RunTree
 
-    def emit_event(self, event: Dict[str, Any]) -> None:
+    def begin_span(
+        self,
+        span_id: str,
+        *,
+        parent_span_id: Optional[str] = None,
+        name: str = "",
+        run_type: str = "chain",
+        inputs: Optional[Dict[str, Any]] = None,
+        tags: Optional[list[str]] = None,
+    ) -> None:
+        with self._lock:
+            if self._finished or self._drop_events:
+                return
+            try:
+                parent = self._spans.get(parent_span_id) if parent_span_id else self._root
+                if parent is None:
+                    parent = self._root
+                child = parent.create_child(
+                    name=name or span_id,
+                    run_type=run_type,
+                    inputs=inputs or {},
+                    tags=tags or ["loopbench_span"],
+                )
+                child.post()
+                self._spans[span_id] = child
+            except Exception as exc:  # noqa: BLE001
+                self._runtime_error = _truncate_text(str(exc), _MAX_ERROR_CHARS)
+
+    def end_span(self, span_id: str, *, outputs: Optional[Dict[str, Any]] = None) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            try:
+                run_tree = self._spans.pop(span_id, None)
+                if run_tree is not None:
+                    run_tree.end(outputs=outputs or {})
+                    run_tree.patch()
+            except Exception as exc:  # noqa: BLE001
+                self._runtime_error = _truncate_text(str(exc), _MAX_ERROR_CHARS)
+
+    def emit_event(self, event: Dict[str, Any], *, span_id: Optional[str] = None) -> None:
         with self._lock:
             if self._finished or self._drop_events:
                 return
@@ -127,8 +183,11 @@ class LangSmithTraceSession:
                 return
 
             try:
+                parent = self._spans.get(span_id) if span_id else self._root
+                if parent is None:
+                    parent = self._root
                 payload = event.get("payload")
-                child = self._root.create_child(
+                child = parent.create_child(
                     name=f"event.{event_type}",
                     run_type=_event_run_type(event_type),
                     inputs={
@@ -143,7 +202,7 @@ class LangSmithTraceSession:
                 child.patch()
 
                 if event_type == "role_phase":
-                    self._emit_role_phase_llm_usage(payload)
+                    self._emit_role_phase_llm_usage(payload, span_id=span_id)
             except Exception as exc:  # noqa: BLE001
                 self._runtime_error = _truncate_text(str(exc), _MAX_ERROR_CHARS)
                 self._drop_events = True
@@ -155,6 +214,15 @@ class LangSmithTraceSession:
             self._finished = True
 
             try:
+                # Auto-close any unclosed spans before finishing root.
+                for sid in list(self._spans.keys()):
+                    try:
+                        run_tree = self._spans.pop(sid)
+                        run_tree.end(outputs={"auto_closed": True})
+                        run_tree.patch()
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 self._root.end(
                     outputs=outputs or {},
                     error=_truncate_text(error, _MAX_ERROR_CHARS) if error else None,
@@ -182,7 +250,7 @@ class LangSmithTraceSession:
         except Exception:  # noqa: BLE001
             return None
 
-    def _emit_role_phase_llm_usage(self, payload: Any) -> None:
+    def _emit_role_phase_llm_usage(self, payload: Any, *, span_id: Optional[str] = None) -> None:
         usage_payload = _extract_role_phase_usage(payload)
         if usage_payload is None:
             return
@@ -204,7 +272,10 @@ class LangSmithTraceSession:
             llm_inputs.update(role_io.get("inputs") or {})
             llm_outputs.update(role_io.get("outputs") or {})
 
-        llm_child = self._root.create_child(
+        parent = self._spans.get(span_id) if span_id else self._root
+        if parent is None:
+            parent = self._root
+        llm_child = parent.create_child(
             name=f"llm.{usage_payload['role']}.{usage_payload['phase']}",
             run_type="llm",
             inputs=llm_inputs,
