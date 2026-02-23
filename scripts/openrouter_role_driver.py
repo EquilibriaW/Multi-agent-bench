@@ -74,6 +74,22 @@ PLANNER_ROLE_PROMPT = (
     "In finalize, focus on final coherence and ship readiness."
 )
 
+REFLECTION_PROMPT = (
+    "Role: reflection analyst. You analyze the execution trace of the most recent review round "
+    "and produce structured knowledge for the next round. Your output is DIRECTIVE — it tells "
+    "agents exactly what to do differently, not what happened. "
+    "Rules: "
+    "1. Write a concise directive (200-500 chars) with embedded fix instructions — like a lint "
+    "error with a fix suggestion. Example: 'coder_a: add flask to requirements.txt before "
+    "running pytest. coder_b: verify app/routes.py imports match installed packages.' "
+    "2. OVERWRITE each knowledge surface completely. Do not append to previous content. "
+    "3. Explicitly list which previous insights are superseded in the 'superseded' array. "
+    "4. Focus on actionable patterns, not raw data. What should change, not what happened. "
+    "5. Keep task_understanding updated with refined understanding of what the task requires. "
+    "6. In failure_patterns, only keep CURRENT failures. Remove resolved ones (backpressure). "
+    "7. In workflow_insights, capture strategic observations about what's working vs not."
+)
+
 GENERIC_CODER_ROLE_PROMPT = (
     "Role: coder (applies equally to coder_a and coder_b). "
     "Do not execute commands yourself; emit tool intents (run_commands/file_updates/patch) for the harness to execute. "
@@ -173,6 +189,20 @@ def main() -> int:
         "coordination_phase": context.get("coordination_phase"),
     }
 
+    if phase == "reflect":
+        output.update(
+            {
+                "directive": _safe_text(parsed.get("directive"), fallback=""),
+                "task_understanding": _safe_text(parsed.get("task_understanding"), fallback=""),
+                "failure_patterns": _safe_text(parsed.get("failure_patterns"), fallback=""),
+                "workflow_insights": _safe_text(parsed.get("workflow_insights"), fallback=""),
+                "superseded": parsed.get("superseded") if isinstance(parsed.get("superseded"), list) else [],
+                "summary": _safe_text(parsed.get("directive"), fallback="reflection complete"),
+            }
+        )
+        _write_json_file(output_path, output)
+        return 0
+
     if phase == "bootstrap":
         plan_md = parsed.get("plan_markdown")
         subtasks = parsed.get("subtasks")
@@ -268,6 +298,7 @@ def _build_payload(
     require_structured = _require_structured_reply(role=role, phase=phase)
 
     prompt_keys = (
+        "reflection_directive",
         "review_stage",
         "task_id",
         "round",
@@ -284,6 +315,7 @@ def _build_payload(
         "last_public_validation",
         "coordination_summary",
         "review_diff_tool",
+        "knowledge_tool",
     )
     user_prompt = {
         "role": role,
@@ -315,12 +347,16 @@ def _build_payload(
 
 
 def _build_system_prompt(*, role: str, phase: str) -> str:
+    if phase == "reflect":
+        return " ".join([TEAM_BASE_PROMPT, REFLECTION_PROMPT, f"Current phase: {phase}."])
     role_prompt = PLANNER_ROLE_PROMPT if role == "planner_reviewer" else GENERIC_CODER_ROLE_PROMPT
     phase_hint = f"Current phase: {phase}."
     return " ".join([TEAM_BASE_PROMPT, role_prompt, phase_hint])
 
 
 def _require_structured_reply(*, role: str, phase: str) -> bool:
+    if phase == "reflect":
+        return True
     if role == "planner_reviewer":
         return True
     # Coders can answer in normal freeform/diff style for implementation/rework.
@@ -372,6 +408,16 @@ def _schema_hint_for_phase(phase: str) -> Dict[str, Any]:
         "run_commands": ["pytest -q", "npm test -- --runInBand"],
         "commit_message": "concise commit message",
     }
+    if phase == "reflect":
+        return {
+            "status": "completed",
+            "directive": "concise coaching instruction for next round (200-500 chars)",
+            "task_understanding": "refined understanding of what the task requires",
+            "failure_patterns": "current failure patterns (rewritten, not appended)",
+            "workflow_insights": "strategic observations about what's working",
+            "superseded": ["list of previous insights that are no longer valid"],
+        }
+
     if phase == "bootstrap":
         return {
             "status": "completed",
@@ -1035,6 +1081,10 @@ def _is_structured_reply_valid(*, phase: str, reply_text: str, parsed: Dict[str,
         return False
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_ -]{1,31}", status.strip()) is None:
         return False
+
+    if phase == "reflect":
+        directive = parsed.get("directive")
+        return isinstance(directive, str) and bool(directive.strip())
 
     if phase == "bootstrap":
         plan_md = parsed.get("plan_markdown")

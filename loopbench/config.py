@@ -99,6 +99,7 @@ class SchedulingConfig(BaseModel):
     mode: Literal["phased", "round_robin", "event_driven"] = "phased"
     phases: List[PhaseConfig] = Field(default_factory=list)
     max_review_rounds: int = 3
+    reflection_enabled: bool = True
 
 
 class AgentsConfig(BaseModel):

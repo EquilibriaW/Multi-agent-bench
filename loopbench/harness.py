@@ -31,6 +31,8 @@ from .role_actions import (
     path_allowed_by_assignment,
     paths_from_unified_patch,
 )
+from .knowledge_surfaces import KnowledgeSurfaces
+from .knowledge_tool_context import build_knowledge_tool_context
 from .review_diff_context import build_candidate_merge_commits, build_review_diff_tool_context
 from .review_logic import (
     PublicValidationRecord,
@@ -84,6 +86,7 @@ class DeterministicHarness(MultiAgentHarness):
         base_commit: str,
         max_review_rounds: int,
         event_logger: EventLogger,
+        reflection_enabled: bool = False,
     ):
         self.run_id = run_id
         self.run_dir = run_dir
@@ -92,6 +95,7 @@ class DeterministicHarness(MultiAgentHarness):
         self.base_commit = base_commit
         self.max_review_rounds = max_review_rounds
         self.event_logger = event_logger
+        self.reflection_enabled = reflection_enabled
         self._tools: ToolRouter | None = None
 
         self.planner = self._pick_planner(role_paths)
@@ -103,6 +107,9 @@ class DeterministicHarness(MultiAgentHarness):
             planner=self.planner,
             coders=self.coders,
         )
+        self.knowledge: Optional[KnowledgeSurfaces] = None
+        if self.reflection_enabled:
+            self.knowledge = KnowledgeSurfaces(self.run_dir / "knowledge")
 
     def run(self, task: TaskPack, budget: Budget, tools) -> Dict[str, Any]:
         state = HarnessState(merged_commits={coder: set() for coder in self.coders})
@@ -226,6 +233,12 @@ class DeterministicHarness(MultiAgentHarness):
 
         subtasks_path.write_text(yaml.safe_dump({"subtasks": subtasks}, sort_keys=False), encoding="utf-8")
 
+        if self.knowledge is not None:
+            self.knowledge.seed_from_bootstrap(
+                plan_md=plan_path.read_text(encoding="utf-8"),
+                subtasks=subtasks,
+            )
+
         seeded_count = self.team.seed_implementation(
             task_id=task.task_id,
             plan_path=plan_path,
@@ -265,7 +278,7 @@ class DeterministicHarness(MultiAgentHarness):
             state.review_round = round_index
             self.artifacts.append_status(f"review round {round_index} started")
 
-            planner_context = {
+            planner_context: Dict[str, Any] = {
                 "task_id": task.task_id,
                 "phase": "review",
                 "review_stage": "select",
@@ -281,6 +294,14 @@ class DeterministicHarness(MultiAgentHarness):
                 "implementation_messages": self._planner_review_messages(round_index=round_index),
                 "latest_coder_outputs": self._latest_coder_outputs(state),
             }
+            if self.knowledge is not None:
+                directive = self.knowledge.directive()
+                if directive:
+                    planner_context["reflection_directive"] = directive
+                planner_context["knowledge_tool"] = build_knowledge_tool_context(
+                    role_path=self.role_paths[self.planner],
+                    knowledge_dir=self.run_dir / "knowledge",
+                )
             # Only present unmerged commits as candidates — already-merged
             # commits waste context and can't be re-merged anyway.
             unmerged_by_role = {
@@ -474,6 +495,17 @@ class DeterministicHarness(MultiAgentHarness):
                     merged_feedback.update(verify_decision.coder_feedback)
                     review_decision.coder_feedback = merged_feedback
 
+            # --- Reflection phase (LLM-driven knowledge distillation) ---
+            if self.knowledge is not None:
+                self._run_reflection(
+                    task=task,
+                    round_index=round_index,
+                    state=state,
+                    last_validation=last_validation,
+                    review_decision=review_decision,
+                    merged_commits_this_round=merged_commits_this_round,
+                )
+
             verify_output = state.role_outputs.get(
                 f"{self.planner}:review_verify:{round_index}",
                 {},
@@ -562,7 +594,7 @@ class DeterministicHarness(MultiAgentHarness):
         candidate_merge_commits: Dict[str, List[Dict[str, Any]]],
         review_diff_tool: Dict[str, Any],
     ) -> ReviewDecision:
-        verify_context = {
+        verify_context: Dict[str, Any] = {
             "task_id": task.task_id,
             "phase": "review_verify",
             "review_stage": "verify",
@@ -575,6 +607,14 @@ class DeterministicHarness(MultiAgentHarness):
             "candidate_merge_commits": candidate_merge_commits,
             "review_diff_tool": review_diff_tool,
         }
+        if self.knowledge is not None:
+            directive = self.knowledge.directive()
+            if directive:
+                verify_context["reflection_directive"] = directive
+            verify_context["knowledge_tool"] = build_knowledge_tool_context(
+                role_path=self.role_paths[self.planner],
+                knowledge_dir=self.run_dir / "knowledge",
+            )
         verify_result = self._invoke_role(
             self.planner,
             "review_verify",
@@ -783,11 +823,11 @@ class DeterministicHarness(MultiAgentHarness):
             driver_phase="rework",
             planner_summary=planner_summary,
             round_index=round_index,
-            extra_context={
-                "public_validate_stdout": validation_stdout[-8000:],
-                "public_validate_stderr": validation_stderr[-8000:],
-                "planner_feedback_by_role": planner_feedback_by_role or {},
-            },
+            extra_context=self._rework_extra_context(
+                validation_stdout=validation_stdout,
+                validation_stderr=validation_stderr,
+                planner_feedback_by_role=planner_feedback_by_role,
+            ),
         )
         self._record_worker_phase_outcomes(
             label=f"rework round {round_index}",
@@ -797,6 +837,103 @@ class DeterministicHarness(MultiAgentHarness):
         self.artifacts.append_status(
             f"rework tasks seeded for round {round_index}: {rework_seed.seeded_count}"
         )
+
+    def _rework_extra_context(
+        self,
+        *,
+        validation_stdout: str,
+        validation_stderr: str,
+        planner_feedback_by_role: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        ctx: Dict[str, Any] = {
+            "public_validate_stdout": validation_stdout[-8000:],
+            "public_validate_stderr": validation_stderr[-8000:],
+            "planner_feedback_by_role": planner_feedback_by_role or {},
+        }
+        if self.knowledge is not None:
+            directive = self.knowledge.directive()
+            if directive:
+                ctx["reflection_directive"] = directive
+            ctx["knowledge_tool"] = build_knowledge_tool_context(
+                role_path=self.role_paths[self.planner],
+                knowledge_dir=self.run_dir / "knowledge",
+            )
+        return ctx
+
+    def _run_reflection(
+        self,
+        *,
+        task: TaskPack,
+        round_index: int,
+        state: HarnessState,
+        last_validation: "PublicValidationRecord",
+        review_decision: "ReviewDecision",
+        merged_commits_this_round: Dict[str, List[str]],
+    ) -> None:
+        """Invoke the planner driver with phase='reflect' to distill knowledge."""
+        assert self.knowledge is not None
+
+        coder_output_summaries: Dict[str, Any] = {}
+        for coder in self.coders:
+            outputs = self._latest_coder_outputs(state).get(coder, [])
+            coder_output_summaries[coder] = outputs[-2:]
+
+        reflection_context: Dict[str, Any] = {
+            "task_id": task.task_id,
+            "phase": "reflect",
+            "round": round_index,
+            "runtime_suffix": f"round_{round_index}_reflect",
+            "validation_result": {
+                "stdout": (last_validation.stdout or "")[-2000:],
+                "stderr": (last_validation.stderr or "")[-2000:],
+                "ok": last_validation.ok,
+                "state": last_validation.state.value,
+            },
+            "review_decision_summary": {
+                "request_rework": review_decision.request_rework,
+                "merge_commits_by_role": {
+                    r: len(c) for r, c in review_decision.merge_commits_by_role.items()
+                },
+                "coder_feedback": review_decision.coder_feedback,
+            },
+            "coder_output_summaries": coder_output_summaries,
+            "merged_commits_this_round": merged_commits_this_round,
+            "current_knowledge": {
+                "directive": self.knowledge.directive(),
+                "task_understanding": self.knowledge.surface("task_understanding"),
+                "failure_patterns": self.knowledge.surface("failure_patterns"),
+                "workflow_insights": self.knowledge.surface("workflow_insights"),
+            },
+            "coordination_summary": self.team.summary(),
+        }
+
+        result = self._invoke_role(
+            self.planner,
+            "reflect",
+            reflection_context,
+            raise_on_failure=False,
+        )
+        state.role_outputs[f"{self.planner}:reflect:{round_index}"] = result.output
+        self.artifacts.write_role_summary(
+            role=self.planner,
+            phase=f"reflect_round_{round_index}",
+            result=result,
+        )
+
+        if result.ok and isinstance(result.output, dict):
+            self.knowledge.update_from_reflection(round_index, result.output)
+            self.event_logger.log(
+                "reflection_update",
+                {
+                    "round_index": round_index,
+                    "directive_chars": len(self.knowledge.directive()),
+                    "superseded": result.output.get("superseded", []),
+                },
+            )
+        else:
+            self.artifacts.append_open_question(
+                f"reflection round {round_index} failed; knowledge surfaces unchanged"
+            )
 
     def _run_parallel_claim_phase(
         self,
