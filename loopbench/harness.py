@@ -33,7 +33,11 @@ from .role_actions import (
 )
 from .knowledge_surfaces import KnowledgeSurfaces
 from .knowledge_tool_context import build_knowledge_tool_context
-from .review_diff_context import build_candidate_merge_commits, build_review_diff_tool_context
+from .review_diff_context import (
+    build_candidate_merge_commits,
+    build_review_diff_tool_context,
+    extract_inline_diffs,
+)
 from .review_logic import (
     PublicValidationRecord,
     PublicValidationState,
@@ -49,7 +53,7 @@ from .review_logic import (
     review_round_has_accepted_work,
     verification_command_stats,
 )
-from .run_artifacts import RunArtifacts
+from .run_artifacts import ReviewLedger, ReviewLedgerEntry, RunArtifacts
 from .schema import Budget, TaskPack, ToolCall
 from .shell import ensure_success, run_command
 from .team_protocol import TeamProtocol
@@ -107,6 +111,7 @@ class DeterministicHarness(MultiAgentHarness):
             planner=self.planner,
             coders=self.coders,
         )
+        self.ledger = ReviewLedger(self.run_dir / "review_ledger.json")
         self.knowledge: Optional[KnowledgeSurfaces] = None
         if self.reflection_enabled:
             self.knowledge = KnowledgeSurfaces(self.run_dir / "knowledge")
@@ -114,6 +119,8 @@ class DeterministicHarness(MultiAgentHarness):
     def run(self, task: TaskPack, budget: Budget, tools) -> Dict[str, Any]:
         state = HarnessState(merged_commits={coder: set() for coder in self.coders})
         start_monotonic = time.monotonic()
+        self._run_start_epoch = time.time()
+        self._budget = budget
         self._tools = tools
 
         self.artifacts.append_status(f"run {self.run_id} started")
@@ -175,11 +182,9 @@ class DeterministicHarness(MultiAgentHarness):
         context = {
             "task_id": task.task_id,
             "task_kind": task.kind,
-            "task_entrypoint": str(Path(task.root_dir) / "public" / task.workspace.entrypoint),
             "phase": "bootstrap",
             "role": self.planner,
             "coders": self.coders,
-            "coordination_db_path": str(self.team.db_path),
             "coordination": {"protocol": "sqlite", "db_path": str(self.team.db_path)},
         }
         result = self._invoke_role(self.planner, "bootstrap", context, raise_on_failure=False, span_id="bootstrap")
@@ -232,6 +237,8 @@ class DeterministicHarness(MultiAgentHarness):
                 },
             ]
 
+        subtasks = self._normalize_subtask_roles(subtasks)
+        subtasks = self._collapse_overlapping_paths(subtasks)
         subtasks_path.write_text(yaml.safe_dump({"subtasks": subtasks}, sort_keys=False), encoding="utf-8")
 
         if self.knowledge is not None:
@@ -250,6 +257,75 @@ class DeterministicHarness(MultiAgentHarness):
             f"bootstrap finished: plan + subtasks written, seeded implementation tasks={seeded_count}"
         )
         self.event_logger.end_span("bootstrap")
+
+    def _normalize_subtask_roles(self, subtasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Normalize subtask roles to valid coder names.
+
+        If the planner outputs generic roles like "coder" instead of "coder_a"/"coder_b",
+        round-robin assign them to actual coder names.
+        """
+        valid_roles = set(self.coders)
+        needs_fix = any(str(s.get("role", "")).strip() not in valid_roles for s in subtasks)
+        if not needs_fix:
+            return subtasks
+
+        self.artifacts.append_open_question(
+            "bootstrap subtasks had invalid role names; normalizing to actual coder names"
+        )
+        rr_idx = 0
+        for subtask in subtasks:
+            role = str(subtask.get("role", "")).strip()
+            if role not in valid_roles:
+                subtask["role"] = self.coders[rr_idx % len(self.coders)]
+                rr_idx += 1
+        return subtasks
+
+    def _collapse_overlapping_paths(self, subtasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """If multiple coders are assigned overlapping file paths, reassign all to one coder.
+
+        Two coders editing the same file guarantees cherry-pick merge conflicts.
+        """
+        if len(self.coders) < 2:
+            return subtasks
+        paths_by_role: Dict[str, Set[str]] = {}
+        for s in subtasks:
+            role = str(s.get("role", ""))
+            paths = set(str(p) for p in s.get("paths", []))
+            paths_by_role.setdefault(role, set()).update(paths)
+
+        roles = [r for r in paths_by_role if r in set(self.coders)]
+        if len(roles) < 2:
+            return subtasks
+
+        # Check pairwise overlap.  "." means full-repo scope and overlaps
+        # with every other role's paths.
+        wildcard_roles = {r for r in roles if "." in paths_by_role.get(r, set())}
+        has_overlap = False
+        if wildcard_roles and len(roles) >= 2:
+            # Any role with "." overlaps with all other roles
+            has_overlap = True
+        else:
+            specific_by_role = {r: {p for p in ps if p != "."} for r, ps in paths_by_role.items() if r in set(self.coders)}
+            role_list = list(specific_by_role.keys())
+            for i, r1 in enumerate(role_list):
+                for r2 in role_list[i + 1 :]:
+                    if specific_by_role[r1] & specific_by_role[r2]:
+                        has_overlap = True
+                        break
+                if has_overlap:
+                    break
+
+        if not has_overlap:
+            return subtasks
+
+        primary = self.coders[0]
+        self.artifacts.append_open_question(
+            f"bootstrap subtasks have overlapping file paths across coders; "
+            f"reassigning all to {primary} to avoid merge conflicts"
+        )
+        for s in subtasks:
+            s["role"] = primary
+        return subtasks
 
     def _implementation_phase(self, task: TaskPack, state: HarnessState) -> None:
         self.event_logger.begin_span("implementation", name="phase.implementation", tags=["phase", "implementation"])
@@ -281,6 +357,8 @@ class DeterministicHarness(MultiAgentHarness):
 
         for round_index in range(1, self.max_review_rounds + 1):
             state.review_round = round_index
+            if self._should_rebootstrap(state):
+                self._rebootstrap(task, state)
             round_span = f"review_round_{round_index}"
             self.event_logger.begin_span(
                 round_span,
@@ -297,13 +375,14 @@ class DeterministicHarness(MultiAgentHarness):
                 "runtime_suffix": f"round_{round_index}",
                 "coder_commits": {coder: self._list_commits(coder, self.base_commit) for coder in self.coders},
                 "last_public_validation": last_validation.as_dict(),
-                "coordination_db_path": str(self.team.db_path),
+                "coordination": {"protocol": "sqlite", "db_path": str(self.team.db_path)},
                 "coordination_summary": self.team.summary(),
                 # Preserve legacy key name consumed by drivers, but include
                 # recent rework/review messages so planner decisions see the
                 # latest coder task lifecycle signals.
                 "implementation_messages": self._planner_review_messages(round_index=round_index),
                 "latest_coder_outputs": self._latest_coder_outputs(state),
+                "review_ledger": self.ledger.as_context(),
             }
             if self.knowledge is not None:
                 directive = self.knowledge.directive()
@@ -320,16 +399,26 @@ class DeterministicHarness(MultiAgentHarness):
                         if c not in state.merged_commits.get(coder, set())]
                 for coder in self.coders
             }
-            planner_context["candidate_merge_commits"] = build_candidate_merge_commits(
+            candidate_merge_commits = build_candidate_merge_commits(
                 role_paths=self.role_paths,
                 coders=self.coders,
                 coder_commits_by_role=unmerged_by_role,
+            )
+            planner_context["candidate_merge_commits"] = candidate_merge_commits
+            planner_context["inline_diffs"] = extract_inline_diffs(
+                role_paths=self.role_paths,
+                coders=self.coders,
+                candidate_merge_commits=candidate_merge_commits,
             )
             planner_context["review_diff_tool"] = build_review_diff_tool_context(
                 role_paths=self.role_paths,
                 planner=self.planner,
                 round_index=round_index,
-                candidate_merge_commits=planner_context["candidate_merge_commits"],
+                candidate_merge_commits=candidate_merge_commits,
+            )
+            planner_context["scratch_merge_results"] = self._scratch_merge_test(
+                state,
+                nominated_commits_by_role=unmerged_by_role,
             )
             review_select_span = f"review_select_{round_index}"
             self.event_logger.begin_span(
@@ -525,30 +614,41 @@ class DeterministicHarness(MultiAgentHarness):
                     "forcing actionable rework."
                 )
 
-            if not force_rework:
-                verify_span = f"verify_{round_index}"
-                self.event_logger.begin_span(
-                    verify_span,
-                    parent_span_id=round_span,
-                    name="step.review_verify",
-                    tags=["step", "review_verify"],
-                )
-                verify_decision = self._run_review_verify(
-                    task=task,
-                    round_index=round_index,
-                    state=state,
-                    last_validation=last_validation,
-                    candidate_merge_commits=planner_context["candidate_merge_commits"],
-                    review_diff_tool=planner_context["review_diff_tool"],
-                    span_id=verify_span,
-                )
-                self.event_logger.end_span(verify_span)
-                if verify_decision.request_rework:
-                    force_rework = True
-                if verify_decision.coder_feedback:
-                    merged_feedback = dict(review_decision.coder_feedback)
-                    merged_feedback.update(verify_decision.coder_feedback)
-                    review_decision.coder_feedback = merged_feedback
+            # Always run verify so the reviewer (tech lead) can give targeted
+            # feedback — even when the harness already detected issues like
+            # merge conflicts or validation failures.
+            harness_issues: List[str] = []
+            if not merge_ok:
+                harness_issues.append("Merge conflict: cherry-pick of nominated commits failed.")
+            if public_policy == "required" and not public_validation_passed:
+                harness_issues.append("Public validation failed (policy=required).")
+            if not accepted_work_present:
+                harness_issues.append("No coder commits were accepted or merged this round.")
+
+            verify_span = f"verify_{round_index}"
+            self.event_logger.begin_span(
+                verify_span,
+                parent_span_id=round_span,
+                name="step.review_verify",
+                tags=["step", "review_verify"],
+            )
+            verify_decision = self._run_review_verify(
+                task=task,
+                round_index=round_index,
+                state=state,
+                last_validation=last_validation,
+                candidate_merge_commits=planner_context["candidate_merge_commits"],
+                review_diff_tool=planner_context["review_diff_tool"],
+                harness_issues=harness_issues,
+                span_id=verify_span,
+            )
+            self.event_logger.end_span(verify_span)
+            if verify_decision.request_rework:
+                force_rework = True
+            if verify_decision.coder_feedback:
+                merged_feedback = dict(review_decision.coder_feedback)
+                merged_feedback.update(verify_decision.coder_feedback)
+                review_decision.coder_feedback = merged_feedback
 
             # --- Reflection phase (LLM-driven knowledge distillation) ---
             if self.knowledge is not None:
@@ -592,6 +692,7 @@ class DeterministicHarness(MultiAgentHarness):
                 "validation_stderr": last_validation.stderr,
                 "state": state,
                 "planner_feedback_by_role": review_decision.coder_feedback,
+                "public_policy": public_policy,
             }
             if not force_rework:
                 self.artifacts.write_review_round_audit(
@@ -599,6 +700,16 @@ class DeterministicHarness(MultiAgentHarness):
                     accepted=True,
                     force_rework=False,
                 )
+                self.ledger.append(ReviewLedgerEntry(
+                    round_index=round_index,
+                    decision="accept",
+                    commits_merged=merged_commits_this_round,
+                    open_issues=list(review_decision.coder_feedback.values()),
+                    validation_passed=public_validation_passed,
+                    merge_ok=merge_ok,
+                    summary=str(planner_result.output.get("summary", "")),
+                    cause="accept",
+                ))
                 if public_validation_passed:
                     accepted_public_pass = True
                 self.event_logger.end_span(round_span)
@@ -619,6 +730,21 @@ class DeterministicHarness(MultiAgentHarness):
                     accepted=False,
                     force_rework=True,
                 )
+                _rework_cause = "merge_conflict" if not merge_ok else (
+                    "validation_fail" if (public_policy == "required" and not public_validation_passed) else
+                    "no_accepted_work"
+                )
+                self.ledger.append(ReviewLedgerEntry(
+                    round_index=round_index,
+                    decision="rework",
+                    commits_merged=merged_commits_this_round,
+                    open_issues=list(review_decision.coder_feedback.values()),
+                    validation_passed=public_validation_passed,
+                    merge_ok=merge_ok,
+                    summary=str(planner_result.output.get("summary", "")),
+                    cause=_rework_cause,
+                    validation_stderr_tail=last_validation.stderr[-1000:],
+                ))
                 rework_span = f"rework_{round_index}"
                 self.event_logger.begin_span(
                     rework_span,
@@ -653,6 +779,21 @@ class DeterministicHarness(MultiAgentHarness):
                 accepted=False,
                 force_rework=True,
             )
+            _rework_cause = "merge_conflict" if not merge_ok else (
+                "validation_fail" if (public_policy == "required" and not public_validation_passed) else
+                "reviewer_rework"
+            )
+            self.ledger.append(ReviewLedgerEntry(
+                round_index=round_index,
+                decision="rework",
+                commits_merged=merged_commits_this_round,
+                open_issues=list(review_decision.coder_feedback.values()),
+                validation_passed=public_validation_passed,
+                merge_ok=merge_ok,
+                summary=str(planner_result.output.get("summary", "")),
+                cause=_rework_cause,
+                validation_stderr_tail=last_validation.stderr[-1000:],
+            ))
 
             rework_span = f"rework_{round_index}"
             self.event_logger.begin_span(
@@ -676,6 +817,7 @@ class DeterministicHarness(MultiAgentHarness):
         last_validation: PublicValidationRecord,
         candidate_merge_commits: Dict[str, List[Dict[str, Any]]],
         review_diff_tool: Dict[str, Any],
+        harness_issues: List[str] | None = None,
         span_id: str | None = None,
     ) -> ReviewDecision:
         verify_context: Dict[str, Any] = {
@@ -684,13 +826,16 @@ class DeterministicHarness(MultiAgentHarness):
             "review_stage": "verify",
             "round": round_index,
             "runtime_suffix": f"round_{round_index}_verify",
-            "coordination_db_path": str(self.team.db_path),
+            "coordination": {"protocol": "sqlite", "db_path": str(self.team.db_path)},
             "coordination_summary": self.team.summary(),
             "last_public_validation": last_validation.as_dict(),
             "latest_coder_outputs": self._latest_coder_outputs(state),
+            "review_ledger": self.ledger.as_context(),
             "candidate_merge_commits": candidate_merge_commits,
             "review_diff_tool": review_diff_tool,
         }
+        if harness_issues:
+            verify_context["harness_issues"] = harness_issues
         if self.knowledge is not None:
             directive = self.knowledge.directive()
             if directive:
@@ -858,7 +1003,7 @@ class DeterministicHarness(MultiAgentHarness):
                 "public_validation_attempts": state.public_validation_attempts,
                 "coordination_summary": self.team.summary(),
             },
-            "coordination_db_path": str(self.team.db_path),
+            "coordination": {"protocol": "sqlite", "db_path": str(self.team.db_path)},
         }
         result = self._invoke_role(self.planner, "finalize", context, raise_on_failure=False, span_id="finalize")
         state.role_outputs[f"{self.planner}:finalize"] = result.output
@@ -894,6 +1039,7 @@ class DeterministicHarness(MultiAgentHarness):
         validation_stderr: str,
         state: HarnessState,
         planner_feedback_by_role: Optional[Dict[str, str]] = None,
+        public_policy: str = "off",
         parent_span_id: str | None = None,
     ) -> None:
         rework_seed = self.team.seed_rework(
@@ -903,7 +1049,13 @@ class DeterministicHarness(MultiAgentHarness):
             planner_feedback_by_role=planner_feedback_by_role,
         )
 
-        planner_summary = self.artifacts.read_text(self.run_dir / "plans" / "plan.md")
+        full_plan = self.artifacts.read_text(self.run_dir / "plans" / "plan.md")
+        # On rework, the feedback is the primary task. The plan is reference
+        # context the coder has already seen — shrink it to keep feedback prominent.
+        if round_index >= 2 and full_plan:
+            planner_summary = full_plan[:500]
+        else:
+            planner_summary = full_plan
         phase_results = self._run_parallel_claim_phase(
             task=task,
             state=state,
@@ -915,6 +1067,8 @@ class DeterministicHarness(MultiAgentHarness):
                 validation_stdout=validation_stdout,
                 validation_stderr=validation_stderr,
                 planner_feedback_by_role=planner_feedback_by_role,
+                state=state,
+                public_policy=public_policy,
             ),
             parent_span_id=parent_span_id,
         )
@@ -933,12 +1087,53 @@ class DeterministicHarness(MultiAgentHarness):
         validation_stdout: str,
         validation_stderr: str,
         planner_feedback_by_role: Optional[Dict[str, str]],
+        state: Optional[HarnessState] = None,
+        public_policy: str = "off",
     ) -> Dict[str, Any]:
         ctx: Dict[str, Any] = {
-            "public_validate_stdout": validation_stdout[-8000:],
-            "public_validate_stderr": validation_stderr[-8000:],
             "planner_feedback_by_role": planner_feedback_by_role or {},
         }
+        # Only include validation output when it's actionable — i.e. validation
+        # actually ran and produced meaningful output.  Raw build logs are capped
+        # to the tail where errors typically appear.
+        has_meaningful_output = (
+            public_policy != "off"
+            and (validation_stdout.strip() or validation_stderr.strip())
+        )
+        if has_meaningful_output:
+            ctx["public_validate_stderr"] = validation_stderr[-4000:]
+            # stdout is lower signal (progress/info); include less
+            if validation_stdout.strip():
+                ctx["public_validate_stdout"] = validation_stdout[-2000:]
+        # Extract each coder's prior failed commands so rework coders see
+        # their own build/test errors even when public_validate_policy=off.
+        if state is not None:
+            prior_failures_by_role: Dict[str, List[Dict[str, Any]]] = {}
+            latest = self._latest_coder_outputs(state)
+            for coder, outputs in latest.items():
+                coder_failures: List[Dict[str, Any]] = []
+                for out_entry in outputs:
+                    for fail in out_entry.get("failed_commands", []):
+                        coder_failures.append(fail)
+                if coder_failures:
+                    prior_failures_by_role[coder] = coder_failures[-5:]
+            if prior_failures_by_role:
+                ctx["prior_command_failures_by_role"] = prior_failures_by_role
+        # Cross-coder visibility: each coder sees peer summaries
+        peer_summaries: Dict[str, Dict[str, Any]] = {}
+        if state is not None:
+            latest = self._latest_coder_outputs(state)
+            for coder, outputs in latest.items():
+                if not outputs:
+                    continue
+                last = outputs[-1]
+                peer_summaries[coder] = {
+                    "summary": last.get("summary", ""),
+                    "files_changed": last.get("files_changed", []),
+                    "commit": last.get("commit"),
+                }
+        if peer_summaries:
+            ctx["peer_progress"] = peer_summaries
         if self.knowledge is not None:
             directive = self.knowledge.directive()
             if directive:
@@ -973,6 +1168,7 @@ class DeterministicHarness(MultiAgentHarness):
             "phase": "reflect",
             "round": round_index,
             "runtime_suffix": f"round_{round_index}_reflect",
+            "review_ledger": self.ledger.as_context(),
             "validation_result": {
                 "stdout": (last_validation.stdout or "")[-2000:],
                 "stderr": (last_validation.stderr or "")[-2000:],
@@ -1165,9 +1361,8 @@ class DeterministicHarness(MultiAgentHarness):
                 task=claimed_task,
                 round_index=round_index,
                 result={
-                    "driver_phase": driver_phase,
                     "status": result.output.get("status", "completed"),
-                    "output_keys": sorted(result.output.keys()),
+                    "summary": result.output.get("summary", ""),
                 },
             )
             if not mark_ok:
@@ -1207,7 +1402,6 @@ class DeterministicHarness(MultiAgentHarness):
                 phase=coordination_phase,
                 limit=30,
             ),
-            "coordination_db_path": str(self.team.db_path),
             "coordination": {
                 "protocol": "sqlite",
                 "db_path": str(self.team.db_path),
@@ -1216,6 +1410,15 @@ class DeterministicHarness(MultiAgentHarness):
             },
         }
         context.update(extra_context)
+        # On rework, inject the coder's own diff so it doesn't waste turns
+        # rediscovering its current state.
+        if driver_phase == "rework" and role in self.role_paths:
+            diff_result = run_command(
+                ["git", "-C", str(self.role_paths[role]), "diff", f"{self.base_commit}..HEAD"],
+                timeout_sec=30,
+            )
+            if diff_result.ok and diff_result.stdout.strip():
+                context["own_diff"] = diff_result.stdout[:6000]
         # Deploy knowledge_tool into the executing role's worktree so the
         # advertised command path resolves correctly for each coder.
         if self.knowledge is not None:
@@ -1224,6 +1427,94 @@ class DeterministicHarness(MultiAgentHarness):
                 knowledge_dir=self.run_dir / "knowledge",
             )
         return self._invoke_role(role, driver_phase, context, raise_on_failure=False, span_id=parent_span_id)
+
+    def _scratch_merge_test(
+        self,
+        state: HarnessState,
+        *,
+        nominated_commits_by_role: Dict[str, List[str]],
+    ) -> Dict[str, Any]:
+        """Test-merge on a temporary branch. Returns per-commit success/failure + conflict files."""
+        planner_path = self.role_paths[self.planner]
+        head_result = run_command(
+            ["git", "-C", str(planner_path), "rev-parse", "HEAD"],
+            timeout_sec=15,
+        )
+        ensure_success(head_result, "git rev-parse HEAD for scratch merge")
+        original_sha = head_result.stdout.strip()
+        original_branch = ""
+        branch_result = run_command(
+            ["git", "-C", str(planner_path), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            timeout_sec=15,
+        )
+        if branch_result.ok:
+            original_branch = branch_result.stdout.strip()
+        round_idx = state.review_round
+        scratch_branch = f"_loopbench_scratch_{round_idx}"
+
+        commits_tested: Dict[str, Dict[str, Any]] = {}
+        all_mergeable = True
+
+        create_result = run_command(
+            ["git", "-C", str(planner_path), "checkout", "-b", scratch_branch],
+            timeout_sec=30,
+        )
+        if not create_result.ok:
+            return {"commits_tested": {}, "all_mergeable": False, "error": "failed to create scratch branch"}
+
+        try:
+            for coder, shas in nominated_commits_by_role.items():
+                for sha in shas:
+                    if sha in state.merged_commits.get(coder, set()):
+                        continue
+                    cherry = run_command(
+                        ["git", "-C", str(planner_path), "cherry-pick", sha],
+                        timeout_sec=120,
+                    )
+                    if cherry.ok:
+                        commits_tested[sha] = {"ok": True, "coder": coder, "conflict_files": []}
+                    else:
+                        all_mergeable = False
+                        # Capture conflict files
+                        diff_result = run_command(
+                            ["git", "-C", str(planner_path), "diff", "--name-only", "--diff-filter=U"],
+                            timeout_sec=15,
+                        )
+                        conflict_files = [
+                            f.strip() for f in diff_result.stdout.splitlines() if f.strip()
+                        ] if diff_result.ok else []
+                        commits_tested[sha] = {
+                            "ok": False,
+                            "coder": coder,
+                            "conflict_files": conflict_files,
+                        }
+                        run_command(
+                            ["git", "-C", str(planner_path), "cherry-pick", "--abort"],
+                            timeout_sec=30,
+                        )
+        finally:
+            # Always restore: checkout original branch and delete scratch
+            restore_target = original_branch or original_sha
+            run_command(
+                ["git", "-C", str(planner_path), "checkout", restore_target],
+                timeout_sec=30,
+            )
+            run_command(
+                ["git", "-C", str(planner_path), "branch", "-D", scratch_branch],
+                timeout_sec=15,
+            )
+            # Paranoia: verify HEAD matches original
+            verify = run_command(
+                ["git", "-C", str(planner_path), "rev-parse", "HEAD"],
+                timeout_sec=15,
+            )
+            if verify.ok and verify.stdout.strip() != original_sha:
+                run_command(
+                    ["git", "-C", str(planner_path), "reset", "--hard", original_sha],
+                    timeout_sec=30,
+                )
+
+        return {"commits_tested": commits_tested, "all_mergeable": all_mergeable}
 
     def _merge_new_commits(
         self,
@@ -1274,6 +1565,10 @@ class DeterministicHarness(MultiAgentHarness):
 
         return ok
 
+    def _inject_time_context(self, context: Dict[str, Any]) -> None:
+        context["run_start_epoch"] = self._run_start_epoch
+        context["run_deadline_epoch"] = self._run_start_epoch + self._budget.wall_clock_sec
+
     def _invoke_role(
         self,
         role: str,
@@ -1283,6 +1578,7 @@ class DeterministicHarness(MultiAgentHarness):
         raise_on_failure: bool = True,
         span_id: str | None = None,
     ) -> RoleRunResult:
+        self._inject_time_context(context)
         driver = self.role_drivers[role]
         result = driver.run_phase(
             phase=phase,
@@ -1296,7 +1592,7 @@ class DeterministicHarness(MultiAgentHarness):
             if exec_mode == "agentic_tool_loop":
                 # Agentic driver already applied changes directly to worktree.
                 # Auto-commit any uncommitted changes for coder roles.
-                if role != self.planner:
+                if True:  # auto-commit all roles including planner
                     commit_msg = (result.output or {}).get(
                         "commit_message", f"{role}: {phase} update"
                     )
@@ -1691,8 +1987,18 @@ class DeterministicHarness(MultiAgentHarness):
             coder = str(key).split(":", 1)[0]
             if coder not in out:
                 continue
-            out[coder].append(
-                {
+            # Extract failed command results for planner visibility
+            failed_commands: List[Dict[str, Any]] = []
+            commands_run = output.get("commands_run", [])
+            if isinstance(commands_run, list):
+                for cmd in commands_run:
+                    if isinstance(cmd, dict) and cmd.get("exit_code", 0) != 0:
+                        failed_commands.append({
+                            "command": str(cmd.get("command", cmd.get("cmd", "")))[:200],
+                            "exit_code": cmd.get("exit_code"),
+                            "stderr_tail": str(cmd.get("stderr", cmd.get("stderr_tail", "")))[-500:],
+                        })
+            entry: Dict[str, Any] = {
                     "output_key": key,
                     "phase": str(output.get("phase") or ""),
                     "summary": str(output.get("summary") or ""),
@@ -1700,9 +2006,85 @@ class DeterministicHarness(MultiAgentHarness):
                     "commit": output.get("commit"),
                     "applied_paths": output.get("applied_paths"),
                     "run_commands_attempted": output.get("run_commands_attempted"),
-                }
-            )
+                    "failed_commands": failed_commands[:5],
+            }
+            # PR packet fields produced by the DSPy driver — pass through
+            # so the reviewer pipeline can consume structured coder metadata.
+            for pr_key in ("files_changed", "key_decisions", "tests_run", "known_risks"):
+                val = output.get(pr_key)
+                if val:
+                    entry[pr_key] = val
+            out[coder].append(entry)
         return {coder: outputs[-4:] for coder, outputs in out.items()}
+
+    def _should_rebootstrap(self, state: HarnessState) -> bool:
+        """Detect stuck loops: 3+ consecutive rework rounds with no new merges."""
+        entries = self.ledger._entries  # direct access for read-only check
+        if len(entries) < 3:
+            return False
+        last_3 = entries[-3:]
+        # All rework, no commits merged in any of them
+        return all(
+            e.decision == "rework" and not any(e.commits_merged.values())
+            for e in last_3
+        )
+
+    def _rebootstrap(self, task: TaskPack, state: HarnessState) -> None:
+        """Re-plan: run bootstrap again with failure context from the ledger."""
+        self.artifacts.append_status(
+            f"re-bootstrap triggered at round {state.review_round}: "
+            "3 consecutive rework rounds with no merged commits"
+        )
+        context: Dict[str, Any] = {
+            "task_id": task.task_id,
+            "task_kind": task.kind,
+            "phase": "bootstrap",
+            "role": self.planner,
+            "coders": self.coders,
+            "coordination": {"protocol": "sqlite", "db_path": str(self.team.db_path)},
+            "review_ledger": self.ledger.as_context(),
+            "is_rebootstrap": True,
+        }
+        result = self._invoke_role(self.planner, "bootstrap", context, raise_on_failure=False, span_id=None)
+        state.role_outputs[f"{self.planner}:rebootstrap:{state.review_round}"] = result.output
+        self.artifacts.write_role_summary(
+            role=self.planner,
+            phase=f"rebootstrap_round_{state.review_round}",
+            result=result,
+        )
+
+        if not result.ok:
+            self.artifacts.append_open_question(
+                "re-bootstrap failed; continuing with existing plan"
+            )
+            return
+
+        # Re-seed subtasks (same logic as _bootstrap_phase)
+        plan_path = self.run_dir / "plans" / "plan.md"
+        subtasks_path = self.run_dir / "plans" / "subtasks.yaml"
+
+        plan_md = result.output.get("plan_markdown")
+        if isinstance(plan_md, str) and plan_md.strip():
+            plan_path.write_text(plan_md, encoding="utf-8")
+
+        subtasks = result.output.get("subtasks")
+        if isinstance(subtasks, list) and subtasks:
+            subtasks = self._normalize_subtask_roles(subtasks)
+            subtasks = self._collapse_overlapping_paths(subtasks)
+            subtasks_path.write_text(
+                yaml.safe_dump({"subtasks": subtasks}, sort_keys=False), encoding="utf-8"
+            )
+            if self.knowledge is not None:
+                self.knowledge.seed_from_bootstrap(
+                    plan_md=plan_path.read_text(encoding="utf-8"),
+                    subtasks=subtasks,
+                )
+            self.team.seed_implementation(
+                task_id=task.task_id,
+                plan_path=plan_path,
+                subtasks_path=subtasks_path,
+                subtasks=subtasks,
+            )
 
     def _pick_planner(self, roles: Iterable[str]) -> str:
         role_list = list(roles)

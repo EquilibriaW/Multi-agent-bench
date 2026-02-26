@@ -159,6 +159,7 @@ class TeamProtocol:
             claim_token=task.claim_token,
             result=result,
         )
+        summary = str(result.get("summary", ""))[:120]
         self.db.post_message(
             phase=phase,
             from_role=role,
@@ -167,9 +168,9 @@ class TeamProtocol:
             round_index=round_index,
             body={
                 "task_id": task.task_id,
-                "driver_phase": result.get("driver_phase"),
                 "status": result.get("status"),
-                "output_keys": result.get("output_keys"),
+                "summary": summary,
+                "detail": f"Use git log / read_file to inspect {role}'s commits.",
             },
         )
         return ok

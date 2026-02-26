@@ -75,13 +75,30 @@ def build_review_diff_tool_context(
     manifest_path = round_dir / "manifest.json"
     rows: List[Dict[str, Any]] = []
     for coder, entries in candidate_merge_commits.items():
+        coder_path = role_paths.get(coder)
         for entry in entries:
+            sha = entry.get("sha", "")
+            patch_rel = None
+            # Pre-materialize patch from the coder worktree so the
+            # review_diff_tool can serve it even when the reviewer's
+            # worktree doesn't have the commit objects (e.g. E2B sandboxes).
+            if coder_path and sha:
+                patch_result = run_command(
+                    ["git", "-C", str(coder_path), "show",
+                     "--pretty=format:", "--no-color", "--unified=3", sha],
+                    timeout_sec=25,
+                )
+                if patch_result.ok and patch_result.stdout.strip():
+                    patch_file = round_dir / f"{coder}_{sha[:12]}.patch"
+                    patch_file.write_text(patch_result.stdout, encoding="utf-8")
+                    patch_rel = patch_file.name
             rows.append(
                 {
                     "coder": coder,
-                    "sha": entry.get("sha"),
+                    "sha": sha,
                     "subject": entry.get("subject"),
                     "files_changed": entry.get("files_changed"),
+                    "patch_path": patch_rel,
                 }
             )
     manifest = {
@@ -102,3 +119,43 @@ def build_review_diff_tool_context(
             "files": f"{command_prefix} files --coder <coder_a|coder_b> --sha <commit_sha>",
         },
     }
+
+
+def extract_inline_diffs(
+    *,
+    role_paths: Dict[str, Path],
+    coders: Iterable[str],
+    candidate_merge_commits: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Extract full diff content for each coder commit for inlining in prompt.
+
+    Returns: {coder: [{sha, subject, files_changed, diff_content}]}
+    """
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for coder in coders:
+        entries = candidate_merge_commits.get(coder, [])
+        if not entries:
+            continue
+        coder_path = role_paths.get(coder)
+        if not coder_path:
+            continue
+        inline_entries: List[Dict[str, Any]] = []
+        for entry in entries:
+            sha = entry.get("sha", "")
+            if not sha:
+                continue
+            diff_result = run_command(
+                ["git", "-C", str(coder_path), "show",
+                 "--pretty=format:", "--no-color", "--unified=3", sha],
+                timeout_sec=25,
+            )
+            diff_content = diff_result.stdout.strip() if diff_result.ok else ""
+            inline_entries.append({
+                "sha": sha,
+                "subject": entry.get("subject", ""),
+                "files_changed": entry.get("files_changed", []),
+                "diff_content": diff_content,
+            })
+        if inline_entries:
+            out[coder] = inline_entries
+    return out

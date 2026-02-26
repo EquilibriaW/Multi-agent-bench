@@ -58,7 +58,7 @@ class KnowledgeSurfaces:
         stale guidance from a previous round does not persist when the
         reflection LLM intentionally clears a section.
         """
-        directive_text = _safe_str(reflection_output.get("directive"), max_chars=600)
+        directive_text = _safe_str(reflection_output.get("directive"), max_chars=1500)
         if directive_text:
             header = f"# Reflection Directive (round {round_index})\n\n"
             self._write_surface("directive", header + directive_text + "\n")
@@ -124,7 +124,13 @@ def _safe_str(value: Any, max_chars: int = 0) -> str:
         return ""
     text = value.strip()
     if max_chars > 0 and len(text) > max_chars:
-        return text[:max_chars]
+        # Truncate at last sentence boundary before the limit.
+        truncated = text[:max_chars]
+        for sep in (".\n", "\n", ". "):
+            boundary = truncated.rfind(sep)
+            if boundary > max_chars // 2:
+                return truncated[: boundary + len(sep)].rstrip() + " [truncated]"
+        return truncated + " [truncated]"
     return text
 
 

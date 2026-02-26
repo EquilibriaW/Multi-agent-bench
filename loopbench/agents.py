@@ -63,7 +63,6 @@ class ShellRoleDriver:
         env: Dict[str, str] | None = None,
         model: str | None = None,
         sandbox: Sandbox | None = None,
-        role_timeout_sec: int = 1800,
     ):
         if not command:
             raise ValueError("shell role driver requires a non-empty command")
@@ -73,7 +72,6 @@ class ShellRoleDriver:
         self.extra_env = env or {}
         self.model = model
         self.sandbox = sandbox
-        self.role_timeout_sec = max(60, min(int(role_timeout_sec), 7200))
 
     def run_phase(
         self,
@@ -125,7 +123,6 @@ class ShellRoleDriver:
             sandbox_result = self.sandbox.exec(
                 ["bash", "-lc", sandbox_command],
                 cwd=str(worktree_path),
-                timeout_sec=self.role_timeout_sec,
                 env=env,
             )
             ok = sandbox_result.ok
@@ -230,6 +227,8 @@ class ShellRoleDriver:
             f"{stem}_openrouter_response.txt",
             f"{stem}_openrouter_attempts.json",
             f"{stem}_command_trace.json",
+            f"{stem}_conversation.json",
+            f"{stem}_conversation.txt",
         ]
 
         run_root = run_dir.resolve()
@@ -274,16 +273,10 @@ def build_role_driver(role_cfg: RoleConfig, *, sandbox: Sandbox | None = None) -
     if role_cfg.driver == "noop":
         return NoopRoleDriver()
     if role_cfg.driver == "shell":
-        timeout_raw = role_cfg.env.get("LOOPBENCH_ROLE_TIMEOUT_SEC")
-        try:
-            role_timeout_sec = int(timeout_raw) if timeout_raw is not None else 1800
-        except ValueError:
-            role_timeout_sec = 1800
         return ShellRoleDriver(
             command=role_cfg.command or "",
             env=role_cfg.env,
             model=role_cfg.model,
             sandbox=sandbox,
-            role_timeout_sec=role_timeout_sec,
         )
     raise ValueError(f"Unsupported role driver: {role_cfg.driver}")

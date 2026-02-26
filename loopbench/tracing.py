@@ -266,6 +266,28 @@ class LangSmithTraceSession:
         io_inputs = role_io.get("inputs", {}) if role_io else {}
         io_outputs = role_io.get("outputs", {}) if role_io else {}
 
+        parent = self._spans.get(span_id) if span_id else self._root
+        if parent is None:
+            parent = self._root
+
+        # Try conversation-based multi-turn tracing
+        output = payload.get("output") if isinstance(payload, dict) else None
+        artifact_paths = output.get("artifact_paths") if isinstance(output, dict) else None
+        conversation = None
+        if isinstance(artifact_paths, dict) and self._run_dir:
+            conv_path_str = _find_artifact_path(artifact_paths, "_conversation.json")
+            if conv_path_str:
+                conversation = _load_json_artifact(run_dir=self._run_dir, artifact_path=conv_path_str)
+
+        if conversation and isinstance(conversation.get("turns"), list):
+            self._emit_conversation_spans(
+                conversation=conversation,
+                usage_payload=usage_payload,
+                parent=parent,
+            )
+            return
+
+        # Fallback: single LLM span (for non-agentic phases or missing artifact)
         # Use full messages array from OpenRouter request for LangSmith chat view
         messages = io_inputs.get("messages", [])
         llm_inputs: Dict[str, Any] = {"messages": messages}
@@ -289,9 +311,6 @@ class LangSmithTraceSession:
             if key in io_outputs:
                 llm_outputs[key] = io_outputs[key]
 
-        parent = self._spans.get(span_id) if span_id else self._root
-        if parent is None:
-            parent = self._root
         llm_child = parent.create_child(
             name=f"llm.{usage_payload['role']}.{usage_payload['phase']}",
             run_type="llm",
@@ -338,6 +357,107 @@ class LangSmithTraceSession:
         llm_child.set(usage_metadata=usage)
         llm_child.end(outputs=llm_child.outputs or {})
         llm_child.patch()
+
+    def _emit_conversation_spans(
+        self,
+        *,
+        conversation: Dict[str, Any],
+        usage_payload: Dict[str, Any],
+        parent: Any,
+    ) -> None:
+        """Create per-turn LLM + tool spans from a conversation artifact."""
+        role = usage_payload["role"]
+        phase = usage_payload["phase"]
+        model = usage_payload["model"]
+
+        # Parent chain span for the whole agentic loop
+        loop_span = parent.create_child(
+            name=f"agentic_loop.{role}.{phase}",
+            run_type="chain",
+            inputs={
+                "system_message": _truncate_text(
+                    _to_json(conversation.get("system_message")),
+                    _MAX_PROMPT_PREVIEW_CHARS,
+                ),
+                "user_message": _truncate_text(
+                    _to_json(conversation.get("user_message")),
+                    _MAX_PROMPT_PREVIEW_CHARS,
+                ),
+            },
+            tags=["loopbench_agentic_loop", role, phase],
+        )
+        loop_span.add_metadata({
+            "ls_provider": "openrouter",
+            "ls_model_name": model,
+            "role": role,
+            "phase": phase,
+            "total_turns": len(conversation.get("turns", [])),
+        })
+        loop_span.post()
+
+        total_usage = _zero_usage_metadata()
+
+        for turn_data in conversation.get("turns", []):
+            turn_num = turn_data.get("turn", 0)
+            assistant_msg = turn_data.get("assistant_message", {})
+            tool_results = turn_data.get("tool_results", [])
+            turn_usage = _normalize_usage_metadata(turn_data.get("usage")) or _zero_usage_metadata()
+            _accumulate_usage_dict(total_usage, turn_usage)
+
+            # LLM span for this turn's API call
+            assistant_content = assistant_msg.get("content", "") if isinstance(assistant_msg, dict) else ""
+            tool_calls = assistant_msg.get("tool_calls", []) if isinstance(assistant_msg, dict) else []
+
+            llm_outputs = {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": assistant_content or "",
+                        "tool_calls": tool_calls,
+                    }
+                }]
+            }
+
+            turn_span = loop_span.create_child(
+                name=f"turn_{turn_num}",
+                run_type="llm",
+                inputs={"messages": [{"role": "assistant", "content": "(continued from previous turn)"}]},
+                outputs=llm_outputs,
+                tags=["loopbench_llm_turn", f"turn_{turn_num}"],
+            )
+            turn_span.add_metadata({
+                "ls_provider": "openrouter",
+                "ls_model_name": model,
+                "turn": turn_num,
+            })
+            turn_span.set(usage_metadata=turn_usage)
+            turn_span.post()
+
+            # Tool spans for each tool execution in this turn
+            for tr in tool_results:
+                tool_name = tr.get("name", "unknown")
+                tool_content = tr.get("content", "")
+                tool_child = turn_span.create_child(
+                    name=f"tool.{tool_name}",
+                    run_type="tool",
+                    inputs={"tool_call_id": tr.get("tool_call_id", ""), "name": tool_name},
+                    tags=["loopbench_tool", tool_name],
+                )
+                tool_child.post()
+                tool_child.end(outputs={
+                    "content": _truncate_text(tool_content, _MAX_RESPONSE_PREVIEW_CHARS),
+                })
+                tool_child.patch()
+
+            turn_span.end(outputs=llm_outputs)
+            turn_span.patch()
+
+        loop_span.set(usage_metadata=total_usage)
+        loop_span.end(outputs={
+            "total_turns": len(conversation.get("turns", [])),
+            "total_usage": total_usage,
+        })
+        loop_span.patch()
 
 
 def build_trace_session(
@@ -779,6 +899,11 @@ def _zero_usage_metadata() -> Dict[str, int]:
         "output_tokens": 0,
         "total_tokens": 0,
     }
+
+
+def _accumulate_usage_dict(total: Dict[str, int], turn: Dict[str, int]) -> None:
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        total[key] = total.get(key, 0) + turn.get(key, 0)
 
 
 def _normalize_usage_metadata(raw: Any) -> Optional[Dict[str, int]]:

@@ -69,6 +69,7 @@ class E2BFirecrackerSandbox:
             create_kwargs["template"] = options.template
 
         self._sandbox = E2BSandbox.create(**create_kwargs)
+        self._last_timeout_refresh = time.monotonic()
         with _sandbox_registry_lock:
             _active_sandbox_ids.add(self._sandbox.sandbox_id)
         # E2B sandboxes run as an unprivileged user; top-level /workspace is not writable.
@@ -100,8 +101,26 @@ class E2BFirecrackerSandbox:
                 pass
             raise
 
+    # Only call set_timeout if more than this fraction of the TTL has elapsed
+    # since the last refresh.  Avoids redundant API calls on rapid exec sequences.
+    _REFRESH_AFTER_FRACTION = 0.25
+
     def name(self) -> str:
         return self._sandbox_name
+
+    def _refresh_timeout(self) -> None:
+        """Reset the E2B sandbox TTL if enough time has elapsed since last refresh."""
+        elapsed = time.monotonic() - self._last_timeout_refresh
+        threshold = self.options.timeout_sec * self._REFRESH_AFTER_FRACTION
+        if elapsed < threshold:
+            return
+        try:
+            self._sandbox.set_timeout(self.options.timeout_sec)
+            self._last_timeout_refresh = time.monotonic()
+        except Exception:  # noqa: BLE001
+            # If set_timeout fails the sandbox may already be dead.
+            # Let the subsequent exec call surface the real error.
+            pass
 
     def exec(
         self,
@@ -110,6 +129,10 @@ class E2BFirecrackerSandbox:
         timeout_sec: int = 600,
         env: Optional[Dict[str, str]] = None,
     ) -> ToolResult:
+        # Refresh sandbox TTL before each command to prevent expiry during
+        # long-running rollouts that span multiple phases.
+        self._refresh_timeout()
+
         cmd_str = shell_quote(cmd)
         if env:
             remote_env = self._translate_env(env)
@@ -120,12 +143,35 @@ class E2BFirecrackerSandbox:
         command_request_timeout = float(max(timeout_sec + 30, int(self._control_request_timeout_sec)))
 
         self._sync_local_to_remote()
-        result = self._commands_run(
-            cmd_str,
-            cwd=remote_cwd,
-            timeout=float(timeout_sec),
-            request_timeout=command_request_timeout,
-        )
+        try:
+            result = self._commands_run(
+                cmd_str,
+                cwd=remote_cwd,
+                timeout=float(timeout_sec),
+                request_timeout=command_request_timeout,
+            )
+        except Exception as run_exc:  # noqa: BLE001
+            # The E2B SDK streaming connection can drop mid-execution
+            # (h11 RemoteProtocolError: "peer closed connection without
+            # sending complete message body").  The command may have
+            # completed inside the sandbox — try to recover files.
+            recovered = self._try_recover_after_stream_drop(run_exc)
+            if not recovered:
+                raise
+            return ToolResult(
+                ts_ms=now_ms(),
+                ok=False,
+                tool="repo.exec",
+                stdout="",
+                stderr=f"e2b stream dropped (files recovered): {run_exc}",
+                exit_code=1,
+                data={
+                    "cwd": str(local_cwd),
+                    "backend": "e2b_firecracker",
+                    "sandbox_id": getattr(self._sandbox, "sandbox_id", None),
+                    "stream_recovery": True,
+                },
+            )
         self._sync_remote_to_local()
 
         stderr = result.stderr or ""
@@ -188,6 +234,33 @@ class E2BFirecrackerSandbox:
             path.resolve().relative_to(self.root)
             return True
         except ValueError:
+            return False
+
+    def _try_recover_after_stream_drop(self, original_exc: Exception) -> bool:
+        """Attempt to sync files back from a sandbox whose streaming connection dropped.
+
+        The E2B SDK's HTTP/1.1 chunked stream to the sandbox can close
+        mid-command (h11 RemoteProtocolError).  The sandbox VM is often
+        still alive — the driver script inside may have finished and written
+        its output files.  This method tries to sync those files back so the
+        harness can read them, preventing total work loss.
+
+        Returns True if file recovery succeeded (caller should return a
+        degraded ToolResult), False if recovery failed (caller should re-raise).
+        """
+        exc_str = str(original_exc).lower()
+        is_stream_error = any(
+            marker in exc_str
+            for marker in ("peer closed", "incomplete chunked", "remoteprotocolerror", "connection reset")
+        )
+        if not is_stream_error:
+            return False
+
+        try:
+            self._sync_remote_to_local()
+            return True
+        except Exception:  # noqa: BLE001
+            # Sandbox is truly dead — nothing to recover.
             return False
 
     def _sync_local_to_remote(self) -> None:
@@ -277,8 +350,13 @@ class E2BFirecrackerSandbox:
             pass
 
         # Replace local tree with remote contents.
-        # Remove existing files first, then extract.
+        # Remove existing files first, then extract.  Preserve .git
+        # (file or directory) — the local worktree's .git pointer
+        # references host paths needed by the harness for git ops.
         for path in sorted(self.root.rglob("*"), reverse=True):
+            rel = path.relative_to(self.root)
+            if rel.parts and rel.parts[0] == ".git":
+                continue
             if path.is_symlink():
                 path.unlink(missing_ok=True)
             elif path.is_file() and self._is_within_root(path):

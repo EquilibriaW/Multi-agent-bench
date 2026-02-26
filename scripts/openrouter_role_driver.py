@@ -56,11 +56,11 @@ DEFAULT_OPENROUTER_HTTP_RETRIES = 4
 DEFAULT_OPENROUTER_HTTP_TIMEOUT_SEC = 90
 
 OUTPUT_TRUNCATE_CHARS = 10000
-MAX_TURNS_CODER = 30
-MAX_TURNS_REVIEWER = 25
-MAX_TURNS_BOOTSTRAP = 5
-MAX_TURNS_REFLECT = 5
-MAX_TURNS_FINALIZE = 10
+MAX_TURNS_CODER = 50
+MAX_TURNS_REVIEWER = 50
+MAX_TURNS_BOOTSTRAP = 50
+MAX_TURNS_REFLECT = 50
+MAX_TURNS_FINALIZE = 50
 
 
 # ---------------------------------------------------------------------------
@@ -75,16 +75,29 @@ TEAM_BASE_PROMPT = (
     "Call submit() when your work is complete."
 )
 
-PLANNER_ROLE_PROMPT = (
-    "Role: planner_reviewer. You own decomposition, review guidance, and final coherence. "
-    "In bootstrap, read the task README and repo structure, then call submit() with your plan and subtasks. "
-    "In review (review_stage=select), use git_show and git_diff_files to inspect each coder commit before nominating merges. "
-    "You MUST inspect every commit you intend to merge — uninspected nominations will be dropped. "
-    "Use exec to run tests on the codebase. "
-    "Call submit() with merge_commits, request_rework, and coder_feedback. "
-    "Use commit SHAs from coder_commits in the prompt; do not use symbolic tokens like HEAD. "
-    "In review_verify (review_stage=verify), run tests on the integrated candidate and decide whether rework is needed. "
-    "In finalize, focus on final coherence and ship readiness."
+BOOTSTRAP_SYSTEM = (
+    "You are a technical planner. Read the task description, explore the repository, "
+    "and decompose the work into subtasks for your 2 coders. "
+    "Use lookup_docs() to check parameter formats before calling submit(). "
+    "Call submit() with plan_markdown and subtasks. "
+    "Split work so coders can work in parallel (different files when possible)."
+)
+
+REVIEW_SYSTEM = (
+    "You are a code reviewer. Complete diffs for each coder are provided inline in the user message — "
+    "read them carefully before doing anything else. "
+    "Evaluate each diff against the task requirements. You may use read_file or exec to explore "
+    "the repo for additional context if needed. "
+    "Use lookup_docs('submit') to check parameter formats before calling submit(). "
+    "When you have formed your judgment, call submit() with: "
+    "merge_commits={\"coder_a\": [\"<full_sha>\"], ...} for correct implementations, "
+    "request_rework=true and coder_feedback={\"coder_a\": \"what to fix\"} for implementations that need work. "
+    "You MUST include at least one SHA in merge_commits if any diff is correct."
+)
+
+FINALIZE_SYSTEM = (
+    "You are doing final integration checks. Verify the code works end-to-end. "
+    "Use read_file and exec to check. Call submit() when satisfied."
 )
 
 GENERIC_CODER_ROLE_PROMPT = (
@@ -94,6 +107,7 @@ GENERIC_CODER_ROLE_PROMPT = (
     "Use read_file to understand existing code before making changes. "
     "Use write_file or apply_patch to modify files. "
     "Use exec to run tests after changes. "
+    "Use lookup_docs() to check parameter formats before calling submit() or other tools. "
     "Call submit(summary, commit_message) when your work is complete."
 )
 
@@ -253,34 +267,6 @@ REVIEWER_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "git_show",
-            "description": "Show the full diff for a specific commit SHA",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "commit_sha": {"type": "string", "description": "Commit SHA to inspect"}
-                },
-                "required": ["commit_sha"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "git_diff_files",
-            "description": "List files changed in a specific commit",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "commit_sha": {"type": "string", "description": "Commit SHA to inspect"}
-                },
-                "required": ["commit_sha"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "submit",
             "description": "Finalize review: submit merge decisions and feedback",
             "parameters": {
@@ -323,7 +309,7 @@ BOOTSTRAP_SUBMIT_TOOL: List[Dict[str, Any]] = [
                             "type": "object",
                             "properties": {
                                 "id": {"type": "string"},
-                                "role": {"type": "string"},
+                                "role": {"type": "string", "enum": ["coder_a", "coder_b"]},
                                 "title": {"type": "string"},
                                 "paths": {"type": "array", "items": {"type": "string"}},
                                 "acceptance": {"type": "string"},
@@ -379,6 +365,188 @@ FINALIZE_SUBMIT_TOOL: List[Dict[str, Any]] = [
         },
     },
 ]
+
+DOCS_TOOL: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_docs",
+            "description": (
+                "Look up usage documentation for a tool or topic before using it. "
+                "Call this when unsure about parameters, valid values, or best practices."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Tool name or topic to look up (e.g. 'submit', 'merge_commits', 'dockerfile_templates')",
+                    }
+                },
+                "required": ["topic"],
+            },
+        },
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Documentation registry (progressive disclosure)
+# ---------------------------------------------------------------------------
+
+_DOCS_REGISTRY: Dict[str, str] = {
+    "submit": (
+        "submit() -- Reviewer variant\n"
+        "Parameters:\n"
+        "  summary: str -- Review summary.\n"
+        "  merge_commits: Dict mapping coder role names to lists of full commit SHAs.\n"
+        "    Valid role keys: \"coder_a\", \"coder_b\" (these are the ONLY valid keys).\n"
+        "    Example: {\"coder_a\": [\"abc123def456...\"], \"coder_b\": [\"789xyz...\"]}\n"
+        "    Do NOT use keys like \"reference\", \"main\", or any other names.\n"
+        "  request_rework: boolean, set to true if implementations need changes.\n"
+        "  coder_feedback: Dict mapping role names to feedback strings.\n"
+        "    Example: {\"coder_a\": \"Fix the return type on line 42\"}\n"
+        "\n"
+        "See also: submit_coder, submit_bootstrap"
+    ),
+    "submit_review": (
+        "submit() -- Reviewer variant\n"
+        "Parameters:\n"
+        "  summary: str -- Review summary.\n"
+        "  merge_commits: Dict mapping coder role names to lists of full commit SHAs.\n"
+        "    Valid role keys: \"coder_a\", \"coder_b\" (these are the ONLY valid keys).\n"
+        "    Example: {\"coder_a\": [\"abc123def456...\"], \"coder_b\": [\"789xyz...\"]}\n"
+        "    Do NOT use keys like \"reference\", \"main\", or any other names.\n"
+        "  request_rework: boolean, set to true if implementations need changes.\n"
+        "  coder_feedback: Dict mapping role names to feedback strings.\n"
+        "    Example: {\"coder_a\": \"Fix the return type on line 42\"}\n"
+    ),
+    "merge_commits": (
+        "merge_commits parameter (used in reviewer submit())\n"
+        "Type: Dict[str, List[str]]\n"
+        "Maps coder role names to lists of full commit SHAs to merge.\n"
+        "Valid role keys: \"coder_a\", \"coder_b\" -- no other keys are accepted.\n"
+        "Example: {\"coder_a\": [\"abc123def456...\"], \"coder_b\": [\"789xyz...\"]}\n"
+        "Do NOT use keys like \"reference\", \"main\", or branch names.\n"
+    ),
+    "submit_coder": (
+        "submit() -- Coder variant\n"
+        "Parameters:\n"
+        "  summary: str -- Summary of what was done.\n"
+        "  commit_message: str -- Git commit message for the changes.\n"
+        "Call submit() after you have made and tested your changes.\n"
+    ),
+    "submit_bootstrap": (
+        "submit() -- Bootstrap/planner variant\n"
+        "Parameters:\n"
+        "  plan_markdown: str -- Full implementation plan in markdown.\n"
+        "  subtasks: List[Dict] -- Subtask objects with fields:\n"
+        "    id: str -- Unique subtask identifier (e.g. \"1\", \"2\").\n"
+        "    role: str -- Must be \"coder_a\" or \"coder_b\".\n"
+        "    title: str -- Short description of the subtask.\n"
+        "    paths: List[str] -- Files this subtask will touch.\n"
+        "    acceptance: str -- Acceptance criteria for completion.\n"
+        "  summary: str -- Short summary of the plan.\n"
+        "Valid role values for subtasks: \"coder_a\", \"coder_b\" only.\n"
+    ),
+    "dockerfile": (
+        "Dockerfile base image recommendations:\n"
+        "  Java 17+: eclipse-temurin:17-jdk (NOT openjdk, which is deprecated on Docker Hub)\n"
+        "  Java 11: eclipse-temurin:11-jdk\n"
+        "  Node.js: node:18-bookworm (use -bookworm not -alpine if native deps needed)\n"
+        "  Python: python:3.11-slim-bookworm\n"
+        "  Ruby: ruby:3.2-bookworm (include build-essential, git, libyaml-dev for native gems)\n"
+        "  Go: golang:1.22-bookworm\n"
+        "  .NET 6+: mcr.microsoft.com/dotnet/sdk:8.0\n"
+        "  .NET 3.1: mcr.microsoft.com/dotnet/sdk:3.1 (EOL but still available)\n"
+        "  Rust: rust:1.77-bookworm\n"
+        "  PHP: php:8.2-cli (or php:8.2-apache for web)\n"
+        "\n"
+        "Tips:\n"
+        "  - Prefer -bookworm or -bullseye over -alpine for apps with native dependencies.\n"
+        "  - Always include build-essential and git for languages with native extensions.\n"
+        "  - Check the repo's version requirements before choosing\n"
+        "    (e.g. java.sourceCompatibility in build.gradle).\n"
+    ),
+    "dockerfile_templates": (
+        "Dockerfile base image recommendations:\n"
+        "  Java 17+: eclipse-temurin:17-jdk (NOT openjdk, which is deprecated on Docker Hub)\n"
+        "  Java 11: eclipse-temurin:11-jdk\n"
+        "  Node.js: node:18-bookworm (use -bookworm not -alpine if native deps needed)\n"
+        "  Python: python:3.11-slim-bookworm\n"
+        "  Ruby: ruby:3.2-bookworm (include build-essential, git, libyaml-dev for native gems)\n"
+        "  Go: golang:1.22-bookworm\n"
+        "  .NET 6+: mcr.microsoft.com/dotnet/sdk:8.0\n"
+        "  .NET 3.1: mcr.microsoft.com/dotnet/sdk:3.1 (EOL but still available)\n"
+        "  Rust: rust:1.77-bookworm\n"
+        "  PHP: php:8.2-cli (or php:8.2-apache for web)\n"
+        "\n"
+        "Tips:\n"
+        "  - Prefer -bookworm or -bullseye over -alpine for apps with native dependencies.\n"
+        "  - Always include build-essential and git for languages with native extensions.\n"
+        "  - Check the repo's version requirements before choosing\n"
+        "    (e.g. java.sourceCompatibility in build.gradle).\n"
+    ),
+    "exec": (
+        "exec tool -- Run a shell command in the repo working directory.\n"
+        "Parameters:\n"
+        "  command: str -- Shell command to execute.\n"
+        "  timeout_sec: int -- Timeout in seconds (capped by sandbox policy).\n"
+        "\n"
+        "Tips:\n"
+        "  - Commands run with shell=True, so pipes and redirects work.\n"
+        "  - Use 'cd' sparingly; paths are relative to the repo root.\n"
+        "  - For long-running builds, increase timeout_sec.\n"
+        "  - Check exit codes: non-zero is appended as [exit code: N].\n"
+        "  - Output is truncated to 10KB; pipe through tail/head for large outputs.\n"
+    ),
+    "apply_patch": (
+        "apply_patch tool -- Apply a unified diff patch.\n"
+        "Parameters:\n"
+        "  patch_text: str -- Unified diff text.\n"
+        "\n"
+        "Format:\n"
+        "  --- a/path/to/file\n"
+        "  +++ b/path/to/file\n"
+        "  @@ -start,count +start,count @@\n"
+        "   context line (space prefix)\n"
+        "  -removed line\n"
+        "  +added line\n"
+        "\n"
+        "Tips:\n"
+        "  - Hunk counts are auto-corrected, so don't worry about exact counts.\n"
+        "  - Context lines MUST start with a space character.\n"
+        "  - Include enough context (3 lines) for unambiguous matching.\n"
+        "  - Paths are relative to repo root.\n"
+        "  - For large changes, prefer write_file over complex patches.\n"
+    ),
+}
+
+
+def _lookup_docs(topic: str) -> str:
+    """Look up documentation for a tool or topic, with fuzzy matching."""
+    topic = topic.lower().strip()
+    if not topic:
+        available = sorted(_DOCS_REGISTRY.keys())
+        return "Please specify a topic. Available topics: " + ", ".join(available)
+
+    # Exact match
+    if topic in _DOCS_REGISTRY:
+        return _DOCS_REGISTRY[topic]
+
+    # Substring match: find all topics containing the query or vice versa
+    matches = [key for key in _DOCS_REGISTRY if topic in key or key in topic]
+    if len(matches) == 1:
+        return _DOCS_REGISTRY[matches[0]]
+    if matches:
+        return (
+            f"Multiple topics match '{topic}': {', '.join(sorted(matches))}.\n"
+            "Please specify one of these exactly."
+        )
+
+    # No match at all
+    available = sorted(_DOCS_REGISTRY.keys())
+    return f"No documentation found for '{topic}'. Available topics: " + ", ".join(available)
 
 
 # ---------------------------------------------------------------------------
@@ -442,39 +610,8 @@ def _build_payload(
     context: Dict[str, Any],
     repo_ctx: Dict[str, Any],
 ) -> Dict[str, Any]:
-    system_prompt = _build_system_prompt(role=role, phase=phase)
-
-    prompt_keys = (
-        "reflection_directive",
-        "review_stage",
-        "task_id",
-        "round",
-        "coordination_phase",
-        "assignment",
-        "claimed_task",
-        "public_validate_stderr",
-        "public_validate_stdout",
-        "planner_summary",
-        "coder_commits",
-        "candidate_merge_commits",
-        "latest_coder_outputs",
-        "implementation_messages",
-        "last_public_validation",
-        "coordination_summary",
-        "review_diff_tool",
-        "knowledge_tool",
-        "validation_result",
-        "review_decision_summary",
-        "coder_output_summaries",
-        "merged_commits_this_round",
-        "current_knowledge",
-    )
-    user_prompt = {
-        "role": role,
-        "phase": phase,
-        **{key: context.get(key) for key in prompt_keys},
-        "repo_context": repo_ctx,
-    }
+    system_prompt = _build_system_prompt(role=role, phase=phase, context=context)
+    user_prompt = _build_user_prompt(role=role, phase=phase, context=context, repo_ctx=repo_ctx)
 
     temperature = float(os.environ.get("OPENROUTER_TEMPERATURE", "0.2"))
     max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4096"))
@@ -488,19 +625,379 @@ def _build_payload(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    # Do NOT set response_format — tools and json_object are mutually exclusive
     reasoning = _reasoning_payload_from_env()
     if reasoning is not None:
         payload["reasoning"] = reasoning
     return payload
 
 
-def _build_system_prompt(*, role: str, phase: str) -> str:
+def _build_user_prompt(
+    *,
+    role: str,
+    phase: str,
+    context: Dict[str, Any],
+    repo_ctx: Dict[str, Any],
+) -> str:
+    """Dispatch to phase-specific prompt builders producing readable markdown."""
+    if phase == "bootstrap":
+        return _build_bootstrap_prompt(context, repo_ctx)
+    if phase == "review":
+        if role == "planner_reviewer":
+            return _build_review_prompt(context, repo_ctx)
+    if phase == "review_verify":
+        if role == "planner_reviewer":
+            return _build_review_verify_prompt(context, repo_ctx)
     if phase == "reflect":
-        return " ".join([TEAM_BASE_PROMPT, REFLECTION_PROMPT, f"Current phase: {phase}."])
-    role_prompt = PLANNER_ROLE_PROMPT if role == "planner_reviewer" else GENERIC_CODER_ROLE_PROMPT
-    phase_hint = f"Current phase: {phase}."
-    return " ".join([TEAM_BASE_PROMPT, role_prompt, phase_hint])
+        return _build_reflect_prompt(context, repo_ctx)
+    if phase == "finalize":
+        return _build_finalize_prompt(context, repo_ctx)
+    # Coder phases (implementation, rework)
+    return _build_coder_prompt(context, repo_ctx)
+
+
+def _build_bootstrap_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+    task_id = context.get("task_id", "unknown")
+    readme = repo_ctx.get("readme_task_md") or "(no task description available)"
+    tracked = repo_ctx.get("tracked_files", [])
+    tree = "\n".join(tracked[:200]) if tracked else "(no tracked files)"
+
+    return (
+        f"# Task: {task_id}\n\n"
+        + _time_budget_line(context)
+        + f"{readme}\n\n"
+        f"## Repository Structure\n```\n{tree}\n```\n\n"
+        "## Your Job\n"
+        "Create an implementation plan and split it into subtasks for your 2 coders.\n"
+        "Call submit() with plan_markdown and subtasks.\n"
+        "Split work so coders can work in parallel (different files when possible).\n"
+    )
+
+
+def _build_review_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+    round_num = context.get("round", "?")
+    readme = repo_ctx.get("readme_task_md") or "(no task description available)"
+
+    parts: List[str] = [f"# Review Round {round_num}\n\n" + _time_budget_line(context) + f"## Task Requirements\n{readme}\n"]
+
+    directive = context.get("reflection_directive")
+    if directive:
+        parts.append(f"## Reflection Directive\n{directive}\n")
+
+    # Inline diffs
+    inline_diffs = context.get("inline_diffs", {})
+    if inline_diffs:
+        for coder, entries in inline_diffs.items():
+            for entry in entries:
+                sha = entry.get("sha", "?")
+                subject = entry.get("subject", "")
+                files = entry.get("files_changed", [])
+                diff = entry.get("diff_content", "")
+                files_str = ", ".join(files[:20]) if files else "(unknown)"
+                parts.append(
+                    f"## {coder} — SHA: {sha}\n"
+                    f"Subject: {subject}\n"
+                    f"Files changed: {files_str}\n"
+                    f"```diff\n{diff}\n```\n"
+                )
+    else:
+        # Fallback: show candidate_merge_commits metadata
+        candidates = context.get("candidate_merge_commits", {})
+        if candidates:
+            for coder, entries in candidates.items():
+                for entry in entries:
+                    sha = entry.get("sha", "?")[:8]
+                    subject = entry.get("subject", "")
+                    files = entry.get("files_changed", [])
+                    files_str = ", ".join(files[:20]) if files else "(unknown)"
+                    parts.append(
+                        f"## {coder} — {subject} ({sha})\n"
+                        f"Files changed: {files_str}\n"
+                        "(diff not available — use git_show to inspect)\n"
+                    )
+
+    # Coder command failures (build/test errors from coder runs)
+    latest_outputs = context.get("latest_coder_outputs", {})
+    if isinstance(latest_outputs, dict):
+        for coder_name, outputs in latest_outputs.items():
+            if not isinstance(outputs, list):
+                continue
+            for out_entry in outputs:
+                failed = out_entry.get("failed_commands", []) if isinstance(out_entry, dict) else []
+                if failed:
+                    parts.append(f"### {coder_name} Command Failures\n")
+                    for f in failed:
+                        stderr_snippet = str(f.get("stderr_tail", ""))[:300]
+                        parts.append(
+                            f"- `{f.get('command', '')}` exit={f.get('exit_code', '?')}"
+                            + (f": {stderr_snippet}" if stderr_snippet else "")
+                            + "\n"
+                        )
+
+    # Previous test results
+    last_val = context.get("last_public_validation", {})
+    if isinstance(last_val, dict):
+        stdout = last_val.get("stdout", "")
+        stderr = last_val.get("stderr", "")
+        val_text = ""
+        if stdout:
+            val_text += stdout[-2000:]
+        if stderr:
+            val_text += f"\n[stderr]\n{stderr[-2000:]}"
+        if val_text.strip():
+            parts.append(f"## Previous Test Results\n```\n{val_text.strip()}\n```\n")
+        else:
+            parts.append("## Previous Test Results\nNo tests run yet.\n")
+    else:
+        parts.append("## Previous Test Results\nNo tests run yet.\n")
+
+    parts.append(
+        "## Your Decision\n"
+        "The diffs above contain the complete code changes from each coder. Review them against the task requirements.\n"
+        "You may use read_file or exec for additional context if the diffs alone are insufficient.\n\n"
+        "When ready, call submit() with:\n"
+        "- merge_commits: include the full SHA for each coder whose diff is correct. "
+        "Example: {\"coder_a\": [\"<full_sha>\"], \"coder_b\": [\"<full_sha>\"]}\n"
+        "- request_rework: set to true if any coder needs to redo their work\n"
+        "- coder_feedback: {\"coder_a\": \"specific feedback\"} for coders that need rework\n\n"
+        "You MUST include SHAs in merge_commits for any correct implementation. Do not return empty merge_commits if a diff is good.\n"
+    )
+
+    return "\n".join(parts)
+
+
+def _build_review_verify_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+    round_num = context.get("round", "?")
+    readme = repo_ctx.get("readme_task_md") or "(no task description available)"
+
+    parts: List[str] = [
+        f"# Integration Verification — Round {round_num}\n\n"
+        + _time_budget_line(context)
+        + f"## Task Requirements\n{readme}\n"
+    ]
+
+    harness_issues = context.get("harness_issues")
+    if harness_issues:
+        parts.append(
+            "## Issues Detected\nThe following problems were detected after your review:\n"
+            + "\n".join(f"- {issue}" for issue in harness_issues)
+            + "\n\nYou MUST provide coder_feedback for each coder explaining what to fix.\n"
+        )
+
+    directive = context.get("reflection_directive")
+    if directive:
+        parts.append(f"## Reflection Directive\n{directive}\n")
+
+    # Show test results (the main input for verify)
+    last_val = context.get("last_public_validation", {})
+    if isinstance(last_val, dict):
+        stdout = last_val.get("stdout", "")
+        stderr = last_val.get("stderr", "")
+        val_text = ""
+        if stdout:
+            val_text += stdout[-3000:]
+        if stderr:
+            val_text += f"\n[stderr]\n{stderr[-2000:]}"
+        if val_text.strip():
+            parts.append(f"## Public Validation Results\n```\n{val_text.strip()}\n```\n")
+        else:
+            parts.append("## Public Validation Results\nNo test output available.\n")
+    else:
+        parts.append("## Public Validation Results\nNo test output available.\n")
+
+    parts.append(
+        "## Your Job\n"
+        "The commits have already been merged. Verify the integrated result works correctly.\n"
+        "Use read_file to inspect the merged code and exec to run tests.\n"
+        "Call submit() with:\n"
+        "- request_rework: true if the integration has problems\n"
+        "- coder_feedback: {role: \"what to fix\"} if rework is needed\n"
+        "- summary: your assessment\n"
+    )
+
+    return "\n".join(parts)
+
+
+def _build_reflect_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+    round_num = context.get("round", "?")
+
+    merged = context.get("merged_commits_this_round", {})
+    merged_summary = ", ".join(f"{c}: {len(shas)}" for c, shas in merged.items()) if merged else "none"
+    review_dec = context.get("review_decision_summary", {})
+    rework = review_dec.get("request_rework", False)
+    coder_fb = review_dec.get("coder_feedback", {})
+
+    val = context.get("validation_result", {})
+    val_ok = val.get("ok", False)
+    val_stdout = val.get("stdout", "")[-2000:]
+    val_stderr = val.get("stderr", "")[-2000:]
+
+    knowledge = context.get("current_knowledge", {})
+
+    return (
+        f"# Reflection — Round {round_num}\n\n"
+        + _time_budget_line(context)
+        + f"## What Happened\n"
+        f"- Merged: {merged_summary}\n"
+        f"- Rework requested: {'yes' if rework else 'no'}\n"
+        f"- Test result: {'ok' if val_ok else 'fail'}\n\n"
+        f"## Test Output\n```\n{val_stdout}\n```\n"
+        + (f"```\n[stderr]\n{val_stderr}\n```\n" if val_stderr.strip() else "")
+        + f"\n## Coder Feedback Given\n{json.dumps(coder_fb, indent=2)}\n\n"
+        f"## Current Knowledge Surfaces\n"
+        f"- directive: {knowledge.get('directive', '(none)')}\n"
+        f"- task_understanding: {knowledge.get('task_understanding', '(none)')}\n"
+        f"- failure_patterns: {knowledge.get('failure_patterns', '(none)')}\n"
+        f"- workflow_insights: {knowledge.get('workflow_insights', '(none)')}\n\n"
+        "## Your Job\n"
+        "Analyze what happened. Produce a directive for the next round.\n"
+        "Call submit() with directive and updated knowledge surfaces.\n"
+    )
+
+
+def _build_coder_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+    claimed = context.get("claimed_task", {})
+    if isinstance(claimed, dict):
+        title = claimed.get("title", "implementation task")
+        acceptance = claimed.get("acceptance", "")
+        paths = claimed.get("paths", [])
+    else:
+        title = "implementation task"
+        acceptance = ""
+        paths = []
+
+    readme = repo_ctx.get("readme_task_md") or "(no task description available)"
+    tracked = repo_ctx.get("tracked_files", [])
+    tree = "\n".join(tracked[:200]) if tracked else "(no tracked files)"
+
+    parts: List[str] = [f"# Assignment: {title}\n\n" + _time_budget_line(context)]
+
+    parts.append(f"## Task Context\n{readme}\n")
+
+    planner_summary = context.get("planner_summary", "")
+    if planner_summary:
+        phase = context.get("phase", "")
+        plan_heading = "## Plan Reference" if phase == "rework" else "## Overall Plan"
+        parts.append(f"{plan_heading}\n{planner_summary}\n")
+
+    directive = context.get("reflection_directive")
+    if directive:
+        parts.append(f"## Reflection Directive\n{directive}\n")
+
+    parts.append(f"## Your Assignment\n{title}\n")
+    if acceptance:
+        parts.append(f"Acceptance criteria: {acceptance}\n")
+    if paths:
+        parts.append(f"Assigned paths: {', '.join(paths)}\n")
+
+    own_diff = context.get("own_diff", "")
+    if own_diff:
+        parts.append(f"## Your Current Changes\n```diff\n{own_diff}\n```\n")
+
+    # Planner feedback
+    feedback_by_role = context.get("planner_feedback_by_role", {})
+    role = context.get("role", "")
+    planner_feedback = feedback_by_role.get(role, "") if isinstance(feedback_by_role, dict) else ""
+    if not planner_feedback:
+        # Check for rework-specific context
+        public_stdout = context.get("public_validate_stdout", "")
+        public_stderr = context.get("public_validate_stderr", "")
+        if public_stdout or public_stderr:
+            parts.append("## Previous Validation Output\n")
+            if public_stdout:
+                parts.append(f"```\n{public_stdout[-2000:]}\n```\n")
+            if public_stderr:
+                parts.append(f"```\n[stderr] {public_stderr[-2000:]}\n```\n")
+            parts.append("")
+        parts.append("## Planner Feedback\nFirst implementation — no prior feedback.\n")
+    else:
+        parts.append(f"## Planner Feedback\n{planner_feedback}\n")
+        public_stdout = context.get("public_validate_stdout", "")
+        public_stderr = context.get("public_validate_stderr", "")
+        if public_stdout or public_stderr:
+            parts.append("## Previous Validation Output\n")
+            if public_stdout:
+                parts.append(f"```\n{public_stdout[-2000:]}\n```\n")
+            if public_stderr:
+                parts.append(f"```\n[stderr] {public_stderr[-2000:]}\n```\n")
+
+    # Show the coder's own prior command failures (build/test errors from
+    # previous rounds) so they can fix issues even when public_validate is off.
+    prior_failures_by_role = context.get("prior_command_failures_by_role", {})
+    prior_failures = prior_failures_by_role.get(role, []) if isinstance(prior_failures_by_role, dict) else []
+    if prior_failures:
+        parts.append("## Previous Command Failures\n")
+        for fail in prior_failures:
+            parts.append(f"Command: `{fail.get('command', '?')}`\n")
+            parts.append(f"Exit code: {fail.get('exit_code', '?')}\n")
+            stderr_tail = fail.get("stderr_tail", "")
+            if stderr_tail:
+                parts.append(f"```\n{stderr_tail}\n```\n")
+
+    parts.append(f"## Repository Files\n```\n{tree}\n```\n")
+    parts.append(
+        "## Instructions\n"
+        "Read the relevant files, implement the changes, run tests, then call submit().\n"
+    )
+
+    return "\n".join(parts)
+
+
+def _build_finalize_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+    readme = repo_ctx.get("readme_task_md") or "(no task description available)"
+    metrics = context.get("metrics_so_far", {})
+    review_rounds = metrics.get("review_round", 0)
+    merge_conflicts = metrics.get("merge_conflicts", 0)
+
+    return (
+        "# Finalize\n\n"
+        + _time_budget_line(context)
+        + f"## Task Requirements\n{readme}\n\n"
+        f"## Status\n"
+        f"Review rounds: {review_rounds}, merge conflicts: {merge_conflicts}\n\n"
+        "## Instructions\n"
+        "Verify final coherence and ship readiness. Use read_file and exec to check.\n"
+        "Call submit() when satisfied.\n"
+    )
+
+
+def _time_budget_line(context: Dict[str, Any]) -> str:
+    deadline = context.get("run_deadline_epoch")
+    if not deadline:
+        return ""
+    remaining = max(0, deadline - time.time())
+    minutes = int(remaining // 60)
+    if minutes >= 60:
+        return f"> **Time budget: {minutes} minutes remaining.**\n\n"
+    elif minutes >= 10:
+        return f"> **Time budget: {minutes} minutes remaining. Be efficient.**\n\n"
+    elif minutes > 0:
+        return f"> **\u26a0 Time budget: {minutes} minutes remaining! Wrap up and submit soon.**\n\n"
+    else:
+        return f"> **\U0001f6a8 Time budget: EXPIRED. Submit immediately.**\n\n"
+
+
+def _build_system_prompt(*, role: str, phase: str, context: Dict[str, Any]) -> str:
+    if phase == "reflect":
+        base = " ".join([TEAM_BASE_PROMPT, REFLECTION_PROMPT, f"Current phase: {phase}."])
+    elif phase == "bootstrap":
+        base = " ".join([TEAM_BASE_PROMPT, BOOTSTRAP_SYSTEM, f"Current phase: {phase}."])
+    elif phase == "finalize":
+        base = " ".join([TEAM_BASE_PROMPT, FINALIZE_SYSTEM, f"Current phase: {phase}."])
+    elif role == "planner_reviewer" and phase in ("review", "review_verify"):
+        base = " ".join([TEAM_BASE_PROMPT, REVIEW_SYSTEM, f"Current phase: {phase}."])
+    else:
+        # Coder phases
+        role_prompt = GENERIC_CODER_ROLE_PROMPT
+        phase_hint = f"Current phase: {phase}."
+        base = " ".join([TEAM_BASE_PROMPT, role_prompt, phase_hint])
+
+    deadline = context.get("run_deadline_epoch")
+    if deadline:
+        remaining = max(0, deadline - time.time())
+        if remaining < 600:
+            base += f" URGENT: Only {int(remaining // 60)} minutes left in the run. Finish and submit immediately."
+
+    return base
 
 
 def _collect_repo_context(*, worktree: Path, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -521,14 +1018,14 @@ def _collect_repo_context(*, worktree: Path, context: Dict[str, Any]) -> Dict[st
 
 def _tools_for_phase(*, role: str, phase: str) -> List[Dict[str, Any]]:
     if phase == "bootstrap":
-        return COMMON_TOOLS + BOOTSTRAP_SUBMIT_TOOL
+        return COMMON_TOOLS + DOCS_TOOL + BOOTSTRAP_SUBMIT_TOOL
     if phase == "reflect":
-        return COMMON_TOOLS + REFLECT_SUBMIT_TOOL
+        return COMMON_TOOLS + DOCS_TOOL + REFLECT_SUBMIT_TOOL
     if phase == "finalize":
-        return COMMON_TOOLS + FINALIZE_SUBMIT_TOOL
+        return COMMON_TOOLS + DOCS_TOOL + FINALIZE_SUBMIT_TOOL
     if role == "planner_reviewer":
-        return COMMON_TOOLS + REVIEWER_TOOLS
-    return COMMON_TOOLS + CODER_TOOLS
+        return COMMON_TOOLS + DOCS_TOOL + REVIEWER_TOOLS
+    return COMMON_TOOLS + DOCS_TOOL + CODER_TOOLS
 
 
 def _max_turns_for_phase(*, role: str, phase: str) -> int:
@@ -564,6 +1061,7 @@ def _run_agentic_loop(
     all_tool_calls: List[Dict[str, Any]] = []
     inspected_commits: Dict[str, set] = {}
     total_usage = _zero_usage_metadata()
+    conversation_turns: List[Dict[str, Any]] = []
     last_turn = max_turns
 
     for turn in range(1, max_turns + 1):
@@ -580,6 +1078,7 @@ def _run_agentic_loop(
             assistant_message = {"role": "assistant", "content": response.get("reply_text", "")}
 
         messages.append(assistant_message)
+        turn_tool_results: List[Dict[str, Any]] = []
 
         tool_calls = assistant_message.get("tool_calls")
         if not isinstance(tool_calls, list) or not tool_calls:
@@ -589,7 +1088,7 @@ def _run_agentic_loop(
         submit_result = None
         for tc in tool_calls:
             fn = tc.get("function", {})
-            fn_name = fn.get("name", "")
+            fn_name = fn.get("name", "").strip()
             try:
                 fn_args = json.loads(fn.get("arguments", "{}"))
             except json.JSONDecodeError:
@@ -607,6 +1106,7 @@ def _run_agentic_loop(
                     "content": "submit() accepted — session ending.",
                 })
                 all_tool_calls.append({"tool": fn_name, "args": fn_args, "result": "accepted"})
+                turn_tool_results.append({"tool_call_id": tc_id, "name": "submit", "content": "accepted"})
                 break
 
             result_text = _execute_tool(fn_name, fn_args, worktree, context, phase)
@@ -620,8 +1120,35 @@ def _run_agentic_loop(
                 "content": result_text,
             })
             all_tool_calls.append({"tool": fn_name, "args": fn_args, "result": result_text})
+            turn_tool_results.append({"tool_call_id": tc_id, "name": fn_name, "content": result_text})
+
+        conversation_turns.append({
+            "turn": turn,
+            "assistant_message": assistant_message,
+            "tool_results": turn_tool_results,
+            "usage": response["usage"],
+        })
 
         if submit_result is not None:
+            try:
+                _write_json_file(
+                    _role_trace_path(output_path, "conversation", ".json"),
+                    {
+                        "role": role,
+                        "phase": phase,
+                        "model": model,
+                        "system_message": messages[0] if messages and messages[0].get("role") == "system" else None,
+                        "user_message": messages[1] if len(messages) > 1 and messages[1].get("role") == "user" else None,
+                        "turns": conversation_turns,
+                        "total_usage": total_usage,
+                    },
+                )
+                _write_text_file(
+                    _role_trace_path(output_path, "conversation", ".txt"),
+                    _render_conversation_transcript(messages, conversation_turns, role, phase, model),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return _build_agentic_output(
                 submit_args=submit_result,
                 all_tool_calls=all_tool_calls,
@@ -635,6 +1162,25 @@ def _run_agentic_loop(
             )
 
     # Budget exhausted or implicit finish
+    try:
+        _write_json_file(
+            _role_trace_path(output_path, "conversation", ".json"),
+            {
+                "role": role,
+                "phase": phase,
+                "model": model,
+                "system_message": messages[0] if messages and messages[0].get("role") == "system" else None,
+                "user_message": messages[1] if len(messages) > 1 and messages[1].get("role") == "user" else None,
+                "turns": conversation_turns,
+                "total_usage": total_usage,
+            },
+        )
+        _write_text_file(
+            _role_trace_path(output_path, "conversation", ".txt"),
+            _render_conversation_transcript(messages, conversation_turns, role, phase, model),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return _build_fallback_output(
         messages=messages,
         all_tool_calls=all_tool_calls,
@@ -695,6 +1241,14 @@ def _build_agentic_output(
         coder_feedback = submit_args.get("coder_feedback", {})
         output["coder_feedback"] = coder_feedback if isinstance(coder_feedback, dict) else {}
         output["summary"] = submit_args.get("summary", f"review {phase} complete")
+        # Pre-mark all inlined commits as inspected (diffs were in the prompt)
+        if context.get("inline_diffs"):
+            for coder_name, diff_entries in context["inline_diffs"].items():
+                bucket = inspected_commits.setdefault(coder_name, set())
+                for diff_entry in diff_entries:
+                    sha = diff_entry.get("sha", "")
+                    if sha and diff_entry.get("diff_content"):
+                        bucket.add(sha)
         # Convert sets to sorted lists for JSON serialization
         output["inspected_commits"] = {
             r: sorted(commits) for r, commits in inspected_commits.items()
@@ -815,20 +1369,6 @@ def _git_available(worktree: Path) -> bool:
     return False
 
 
-_GIT_UNAVAILABLE_HINT = (
-    "error: git is not available in this sandbox (worktree gitdir points to host filesystem). "
-    "Use exec() with review_diff_tool.py to inspect commits instead. Example:\n"
-    "  exec({\"command\": \"python .loopbench/artifacts/review_diffs/review_diff_tool.py "
-    "--manifest .loopbench/artifacts/review_diffs/round_N/manifest.json list\"})\n"
-    "  exec({\"command\": \"python .loopbench/artifacts/review_diffs/review_diff_tool.py "
-    "--manifest .loopbench/artifacts/review_diffs/round_N/manifest.json show "
-    "--coder CODER --sha COMMIT_SHA\"})\n"
-    "  exec({\"command\": \"python .loopbench/artifacts/review_diffs/review_diff_tool.py "
-    "--manifest .loopbench/artifacts/review_diffs/round_N/manifest.json files "
-    "--coder CODER --sha COMMIT_SHA\"})\n"
-    "Replace round_N with the current review round number from your context."
-)
-
 
 def _execute_tool_inner(
     fn_name: str,
@@ -837,6 +1377,10 @@ def _execute_tool_inner(
     context: Dict[str, Any],
     phase: str,
 ) -> str:
+    if fn_name == "lookup_docs":
+        topic = fn_args.get("topic", "").lower().strip()
+        return _lookup_docs(topic)
+
     policy = _get_command_policy()
     default_timeout = policy["command_timeout_sec"]
 
@@ -951,7 +1495,7 @@ def _execute_tool_inner(
 
     if fn_name in ("git_status", "git_diff", "git_log", "git_show", "git_diff_files"):
         if not _git_available(worktree):
-            return _GIT_UNAVAILABLE_HINT
+            return "error: git is not available in this sandbox."
 
     if fn_name == "git_status":
         try:
@@ -1014,18 +1558,13 @@ def _execute_tool_inner(
         cmd = ["git", "show", "--stat", "--patch", commit_sha]
         try:
             proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=str(worktree),
-                timeout=60,
+                cmd, capture_output=True, text=True, cwd=str(worktree), timeout=60,
             )
         except subprocess.TimeoutExpired:
             return "error: git show timed out"
-        output = proc.stdout
-        if proc.returncode != 0 and proc.stderr:
-            output += f"\n[stderr]\n{proc.stderr}"
-        return _truncate_output(output) if output.strip() else f"(no output for {commit_sha})"
+        if proc.returncode == 0:
+            return _truncate_output(proc.stdout) if proc.stdout.strip() else f"(no output for {commit_sha})"
+        return f"error: git show failed for {commit_sha}: {proc.stderr.strip()}"
 
     if fn_name == "git_diff_files":
         commit_sha = fn_args.get("commit_sha", "")
@@ -1034,18 +1573,13 @@ def _execute_tool_inner(
         cmd = ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha]
         try:
             proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=str(worktree),
-                timeout=30,
+                cmd, capture_output=True, text=True, cwd=str(worktree), timeout=30,
             )
         except subprocess.TimeoutExpired:
             return "error: git diff-tree timed out"
-        output = proc.stdout
-        if proc.returncode != 0 and proc.stderr:
-            output += f"\n[stderr]\n{proc.stderr}"
-        return _truncate_output(output) if output.strip() else f"(no files changed in {commit_sha})"
+        if proc.returncode == 0:
+            return _truncate_output(proc.stdout) if proc.stdout.strip() else f"(no files changed in {commit_sha})"
+        return f"error: git diff-tree failed for {commit_sha}: {proc.stderr.strip()}"
 
     return f"error: unknown tool '{fn_name}'"
 
@@ -1521,6 +2055,106 @@ def _read_json_file(path: Path) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"context JSON must be an object: {path}")
     return data
+
+
+def _render_conversation_transcript(
+    messages: List[Dict[str, Any]],
+    conversation_turns: List[Dict[str, Any]],
+    role: str,
+    phase: str,
+    model: str,
+) -> str:
+    """Render a human-readable transcript of the agentic conversation."""
+    lines: List[str] = []
+    lines.append(f"{role} / {phase}  ({model})")
+    lines.append("")
+
+    # System and user prompts (truncated)
+    for msg in messages[:2]:
+        msg_role = msg.get("role", "")
+        content = msg.get("content", "")
+        if not content:
+            continue
+        if len(content) > 3000:
+            content = content[:3000] + "\n... (truncated)"
+        lines.append(f"[{msg_role}]")
+        lines.append(content)
+        lines.append("")
+
+    lines.append("---")
+    lines.append("")
+
+    for turn_data in conversation_turns:
+        turn_num = turn_data.get("turn", 0)
+        assistant_msg = turn_data.get("assistant_message", {})
+        tool_results = turn_data.get("tool_results", [])
+        usage = turn_data.get("usage", {})
+
+        tokens = usage.get("total_tokens", 0)
+        lines.append(f"[turn {turn_num}]  ({tokens} tok)")
+
+        # Assistant reasoning text
+        content = ""
+        if isinstance(assistant_msg, dict):
+            content = assistant_msg.get("content") or ""
+        if content:
+            lines.append(content.strip())
+            lines.append("")
+
+        # Tool calls and results
+        tool_calls = assistant_msg.get("tool_calls", []) if isinstance(assistant_msg, dict) else []
+        result_map = {tr.get("tool_call_id"): tr for tr in tool_results}
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            fn_name = fn.get("name", "?")
+            raw_args = fn.get("arguments", "{}")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except (json.JSONDecodeError, TypeError):
+                args = raw_args
+
+            # Compact arg display
+            if isinstance(args, dict):
+                if fn_name in ("read_file", "list_files"):
+                    arg_str = args.get("path", str(args))
+                elif fn_name == "write_file":
+                    path = args.get("path", "?")
+                    content_len = len(args.get("content", ""))
+                    arg_str = f"{path}  ({content_len} chars)"
+                elif fn_name == "exec":
+                    arg_str = args.get("command", str(args))
+                elif fn_name == "submit":
+                    arg_str = (args.get("summary") or "")[:120]
+                elif fn_name == "apply_patch":
+                    patch = args.get("patch_text", "")
+                    arg_str = f"({len(patch)} chars)"
+                elif fn_name == "lookup_docs":
+                    arg_str = args.get("topic", str(args))
+                else:
+                    arg_str = json.dumps(args, ensure_ascii=False)
+                    if len(arg_str) > 200:
+                        arg_str = arg_str[:200] + "..."
+            else:
+                arg_str = str(args)[:200]
+
+            lines.append(f"  > {fn_name}({arg_str})")
+
+            # Result
+            tc_id = tc.get("id", "")
+            tr = result_map.get(tc_id, {})
+            result_content = tr.get("content", "")
+            if result_content:
+                # Truncate long results but keep enough to be useful
+                if len(result_content) > 800:
+                    result_content = result_content[:800] + "\n    ... (truncated)"
+                for rline in result_content.split("\n"):
+                    lines.append(f"    {rline}")
+            lines.append("")
+
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:

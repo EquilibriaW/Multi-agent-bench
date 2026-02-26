@@ -6,12 +6,75 @@ Run-scoped artifact writer helpers used by orchestration components.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from .agents import RoleRunResult
 from .path_utils import safe_path_component
 from .review_logic import PublicValidationRecord, ReviewDecision
+
+
+@dataclass
+class ReviewLedgerEntry:
+    round_index: int
+    decision: str  # "accept" | "rework"
+    commits_merged: Dict[str, List[str]] = field(default_factory=dict)
+    open_issues: List[str] = field(default_factory=list)
+    validation_passed: bool = False
+    merge_ok: bool = True
+    summary: str = ""
+    cause: str = ""  # "validation_fail" | "merge_conflict" | "reviewer_rework" | "no_accepted_work" | "accept"
+    validation_stderr_tail: str = ""  # last 1000 chars of validation stderr
+
+
+class ReviewLedger:
+    def __init__(self, path: Path):
+        self._path = path
+        self._entries: List[ReviewLedgerEntry] = []
+        if self._path.exists():
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                for raw in data:
+                    self._entries.append(ReviewLedgerEntry(**raw))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    def append(self, entry: ReviewLedgerEntry) -> None:
+        self._entries.append(entry)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(
+            json.dumps([self._serialize(e) for e in self._entries], indent=2),
+            encoding="utf-8",
+        )
+
+    def as_context(self) -> Dict[str, Any]:
+        """Last 3 entries in full, earlier rounds as one-line summaries."""
+        if not self._entries:
+            return {"entries": [], "prior_summaries": []}
+        recent = self._entries[-3:]
+        earlier = self._entries[:-3]
+        return {
+            "entries": [self._serialize(e) for e in recent],
+            "prior_summaries": [
+                f"round {e.round_index}: {e.decision} cause={e.cause}, merge_ok={e.merge_ok}, validation={e.validation_passed}"
+                for e in earlier
+            ],
+        }
+
+    @staticmethod
+    def _serialize(entry: ReviewLedgerEntry) -> Dict[str, Any]:
+        return {
+            "round_index": entry.round_index,
+            "decision": entry.decision,
+            "commits_merged": entry.commits_merged,
+            "open_issues": entry.open_issues,
+            "validation_passed": entry.validation_passed,
+            "merge_ok": entry.merge_ok,
+            "summary": entry.summary,
+            "cause": entry.cause,
+            "validation_stderr_tail": entry.validation_stderr_tail,
+        }
 
 
 class RunArtifacts:

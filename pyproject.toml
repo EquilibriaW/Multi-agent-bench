@@ -10,6 +10,8 @@ dependencies = [
   "e2b-code-interpreter>=1.0.0",
   "langsmith>=0.7",
   "hodoscope>=0.1",
+  "dspy-ai>=2.5",
+  "litellm>=1.40",
 ]
 
 [project.scripts]
