@@ -1,0 +1,33 @@
+experiment_id: eval-10x1-execute-dispatch-v7
+
+tasks:
+  - .tmp/abc_out/task_threedr3am_learnjavabug__shiro_auth_bypass_demo
+  - .tmp/abc_out/task_exoego_rspec_openapi__images
+  - .tmp/abc_out/task_ashirt_ops_ashirt_server__evidence
+  - .tmp/abc_out/task_restsend_rustpbx__ami_management_api
+  - .tmp/abc_out/task_cretueusebiu_laravel_vue_spa__session_and_authenticated_user
+  - .tmp/abc_out/task_davila7_claude_code_templates__blog_content
+  - .tmp/abc_out/task_conclave_team_conclave__page_rendering
+  - .tmp/abc_out/task_danielschuster_muc_potter_db__spells
+  - .tmp/abc_out/task_adventurelookup_adventurelookup__adventure_search_api
+  - .tmp/abc_out/task_hagopj13_node_express_boilerplate__authentication
+
+lineups:
+  - name: kimi-k2.5
+    planner_model: moonshotai/kimi-k2.5
+    coder_a_model: moonshotai/kimi-k2.5
+    coder_b_model: moonshotai/kimi-k2.5
+    role_command: scripts/dspy_role_driver.py
+    role_env:
+      OPENROUTER_API_KEY_ENV: OPEN_ROUTER_API_KEY
+      OPENROUTER_APP_TITLE: loopbench-team
+      OPENROUTER_HTTP_REFERER: https://localhost/loopbench
+      OPENROUTER_TEMPERATURE: "0.2"
+      OPENROUTER_MAX_TOKENS: "16384"
+      OPENROUTER_HTTP_TIMEOUT_SEC: "90"
+      OPENROUTER_HTTP_RETRIES: "4"
+
+rollouts_per_task: 1
+max_parallel_rollouts: 1
+available_agent_sandboxes: 3
+runtime_config: configs/runtime.e2b.openrouter.longrun.yaml

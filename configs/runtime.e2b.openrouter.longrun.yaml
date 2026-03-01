@@ -3,10 +3,15 @@ sandbox_backend:
   image: null
   network: none
   e2b:
-    template: null
+    template: loopbench-judge-docker
     timeout_sec: 10800
     allow_internet_access: true
     api_key_env: E2B_API_KEY
+    max_concurrent_creates: 6
+    max_concurrent_syncs: 24
+    create_timeout_sec: 1800
+    create_drain_timeout_sec: 120
+    init_command_timeout_sec: 300
 
 env_runner:
   kind: host_process

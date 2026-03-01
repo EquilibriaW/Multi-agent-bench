@@ -17,9 +17,6 @@ _DEFAULT_EVENT_TYPES = {
     "run_started",
     "role_phase",
     "run_finished",
-    "tool_call",
-    "tool_result",
-    "tool_denied",
     "merge_commit",
     "merge_commit_failed",
 }
@@ -279,6 +276,13 @@ class LangSmithTraceSession:
             if conv_path_str:
                 conversation = _load_json_artifact(run_dir=self._run_dir, artifact_path=conv_path_str)
 
+        # Fallback: infer conversation path from request artifact when not registered
+        if conversation is None and self._run_dir and isinstance(artifact_paths, dict):
+            req_path_str = _find_artifact_path(artifact_paths, "_openrouter_request.json")
+            if req_path_str:
+                conv_inferred = req_path_str.replace("_openrouter_request.json", "_conversation.json")
+                conversation = _load_json_artifact(run_dir=self._run_dir, artifact_path=conv_inferred)
+
         if conversation and isinstance(conversation.get("turns"), list):
             self._emit_conversation_spans(
                 conversation=conversation,
@@ -533,7 +537,7 @@ def _resolve_event_types() -> Optional[Set[str]]:
 
     event_types = set(_DEFAULT_EVENT_TYPES)
     if _read_bool_env("LOOPBENCH_LANGSMITH_INCLUDE_TOOL_EVENTS", default=False):
-        event_types.update({"tool_call", "tool_result"})
+        event_types.update({"tool_call", "tool_result", "tool_denied"})
     return event_types
 
 
@@ -668,11 +672,53 @@ def _extract_role_phase_io(payload: Any, run_dir: Path | None) -> Dict[str, Any]
             if review_diff_tool_preview:
                 out["inputs"]["review_diff_tool_preview"] = review_diff_tool_preview
 
+            # When no openrouter_request.json exists (e.g. dspy driver), construct
+            # synthetic messages from context.json so LangSmith shows useful input.
+            if "messages" not in out["inputs"]:
+                synthetic = _build_synthetic_messages(context_json)
+                if synthetic:
+                    out["inputs"]["messages"] = synthetic
+
     if response_path:
         response_text = _load_text_artifact(run_dir=run_dir, artifact_path=response_path)
         if response_text:
             out["outputs"]["openrouter_response_preview"] = _truncate_text(
                 response_text,
+                _MAX_RESPONSE_PREVIEW_CHARS,
+            )
+
+    # Fallback: reconstruct response preview from output JSON when response.txt missing
+    if "openrouter_response_preview" not in out["outputs"]:
+        output_path = _find_artifact_path(artifact_paths, "_output.json")
+        if output_path:
+            output_json = _load_json_artifact(run_dir=run_dir, artifact_path=output_path)
+            if isinstance(output_json, dict):
+                fallback_parts = []
+                for key in ("summary", "notes", "plan_markdown", "directive"):
+                    val = output_json.get(key)
+                    if isinstance(val, str) and val.strip():
+                        fallback_parts.append(f"[{key}]: {val.strip()}")
+                if fallback_parts:
+                    out["outputs"]["openrouter_response_preview"] = _truncate_text(
+                        "\n\n".join(fallback_parts),
+                        _MAX_RESPONSE_PREVIEW_CHARS,
+                    )
+
+    # Second fallback: use event payload output fields directly (avoids disk read)
+    if "openrouter_response_preview" not in out["outputs"]:
+        fallback_parts = []
+        for key in ("summary", "notes", "plan_markdown", "directive"):
+            val = output.get(key)
+            if isinstance(val, str) and val.strip():
+                fallback_parts.append(f"[{key}]: {val.strip()}")
+        # For error phases, include the error message
+        if not fallback_parts:
+            err = output.get("error")
+            if isinstance(err, str) and err.strip():
+                fallback_parts.append(f"[error]: {err.strip()}")
+        if fallback_parts:
+            out["outputs"]["openrouter_response_preview"] = _truncate_text(
+                "\n\n".join(fallback_parts),
                 _MAX_RESPONSE_PREVIEW_CHARS,
             )
 
@@ -737,6 +783,56 @@ def _extract_chat_messages(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not out_messages:
         return {}
     return {"messages": out_messages}
+
+
+def _build_synthetic_messages(context_json: Dict[str, Any]) -> list[Dict[str, str]]:
+    """Build a synthetic messages array from a role context JSON.
+
+    Used when no ``_openrouter_request.json`` exists (e.g. DSPy driver) so that
+    LangSmith LLM spans show meaningful input.
+    """
+    parts: list[str] = []
+    role = context_json.get("role", "")
+    phase = context_json.get("phase", "")
+    if role or phase:
+        parts.append(f"[role={role} phase={phase}]")
+
+    # Planner summary (main context for coders)
+    planner_summary = context_json.get("planner_summary")
+    if isinstance(planner_summary, str) and planner_summary.strip():
+        parts.append(f"## Plan\n{planner_summary.strip()}")
+
+    # Claimed subtask
+    claimed = context_json.get("claimed_task")
+    if isinstance(claimed, dict):
+        title = claimed.get("title", "")
+        accept = claimed.get("acceptance", "")
+        if title:
+            parts.append(f"## Subtask: {title}")
+        if accept:
+            parts.append(f"Acceptance: {accept}")
+
+    # Directive (from reflect phase)
+    directive = context_json.get("directive")
+    if isinstance(directive, str) and directive.strip():
+        parts.append(f"## Directive\n{directive.strip()}")
+
+    # Inbox messages
+    inbox = context_json.get("inbox")
+    if isinstance(inbox, list) and inbox:
+        inbox_lines = []
+        for msg in inbox[-5:]:
+            if isinstance(msg, dict):
+                fr = msg.get("from_role", "?")
+                body = _message_body_preview(msg.get("body"))
+                inbox_lines.append(f"  {fr}: {body}")
+        if inbox_lines:
+            parts.append("## Inbox\n" + "\n".join(inbox_lines))
+
+    if not parts:
+        return []
+    content = _truncate_text("\n\n".join(parts), _MAX_PROMPT_PREVIEW_CHARS)
+    return [{"role": "user", "content": content}]
 
 
 def _summarize_coordination_messages(raw_messages: Any) -> list[str]:

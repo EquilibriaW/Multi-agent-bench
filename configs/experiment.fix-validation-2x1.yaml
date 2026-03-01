@@ -1,0 +1,26 @@
+experiment_id: fix-validation-2x1-r3
+
+tasks:
+  - .tmp/abc_out/task_auth0_auth0_react__users
+  - .tmp/abc_out/task_ardalis_cachedrepository__catalog_pages
+
+lineups:
+  - name: kimi-k2.5
+    planner_model: moonshotai/kimi-k2.5
+    coder_a_model: moonshotai/kimi-k2.5
+    coder_b_model: moonshotai/kimi-k2.5
+    role_command: scripts/openrouter_role_driver.py
+    role_env:
+      OPENROUTER_API_KEY_ENV: OPEN_ROUTER_API_KEY
+      OPENROUTER_APP_TITLE: loopbench-team
+      OPENROUTER_HTTP_REFERER: https://localhost/loopbench
+      OPENROUTER_TEMPERATURE: "0.2"
+      OPENROUTER_MAX_TOKENS: "16384"
+      OPENROUTER_HTTP_TIMEOUT_SEC: "90"
+      OPENROUTER_HTTP_RETRIES: "4"
+
+
+rollouts_per_task: 1
+max_parallel_rollouts: 2
+available_agent_sandboxes: 6
+runtime_config: configs/runtime.e2b.openrouter.longrun.yaml

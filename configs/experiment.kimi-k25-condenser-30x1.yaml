@@ -1,0 +1,53 @@
+experiment_id: kimi-k25-condenser-docker-30x1-r7
+
+tasks:
+  - .tmp/abc_out/task_15dkatz_official_joke_api__filtered_joke_lookup
+  - .tmp/abc_out/task_15dkatz_official_joke_api__metadata
+  - .tmp/abc_out/task_15dkatz_official_joke_api__random_jokes
+  - .tmp/abc_out/task_15dkatz_official_joke_api__root_and_health
+  - .tmp/abc_out/task_1chz_realworld_java21_springboot3__article_comments
+  - .tmp/abc_out/task_1chz_realworld_java21_springboot3__article_favorites
+  - .tmp/abc_out/task_1chz_realworld_java21_springboot3__articles
+  - .tmp/abc_out/task_1chz_realworld_java21_springboot3__profiles_relationships
+  - .tmp/abc_out/task_1chz_realworld_java21_springboot3__tags
+  - .tmp/abc_out/task_1chz_realworld_java21_springboot3__users_authentication
+  - .tmp/abc_out/task_3pillarlabs_socialauth__contacts_and_sharing
+  - .tmp/abc_out/task_3pillarlabs_socialauth__registration_and_account_linking
+  - .tmp/abc_out/task_99designs_gqlgen__todo_graphql_api
+  - .tmp/abc_out/task_active_elastic_job_active_elastic_job__health
+  - .tmp/abc_out/task_active_elastic_job_active_elastic_job__job_dispatch
+  - .tmp/abc_out/task_active_elastic_job_active_elastic_job__random_strings
+  - .tmp/abc_out/task_adrianvlupu_c4_builder__static_documentation_delivery
+  - .tmp/abc_out/task_adventurelookup_adventurelookup__adventure_search_api
+  - .tmp/abc_out/task_adventurelookup_adventurelookup__autocomplete_similarity
+  - .tmp/abc_out/task_aidotnet_opendeepwiki__authentication_self_service
+  - .tmp/abc_out/task_aidotnet_opendeepwiki__configuration_files_integrations
+  - .tmp/abc_out/task_aidotnet_opendeepwiki__localization_knowledge_delivery
+  - .tmp/abc_out/task_air_go_rpc__health_and_diagnostics
+  - .tmp/abc_out/task_air_go_rpc__metadata
+  - .tmp/abc_out/task_air_go_rpc__utility
+  - .tmp/abc_out/task_allanzhuo_yyblog__wechat_mini_program_content_apis
+  - .tmp/abc_out/task_amatsuda_html5_validators__item_html5_validation_demos
+  - .tmp/abc_out/task_withsalt_bilibililivetools__live_room_settings
+  - .tmp/abc_out/task_zhongjinggz_geekdemo__organization_management
+  - .tmp/abc_out/task_zzzzbw_fame__comments_media_settings
+
+lineups:
+  - name: kimi-k2.5
+    planner_model: moonshotai/kimi-k2.5
+    coder_a_model: moonshotai/kimi-k2.5
+    coder_b_model: moonshotai/kimi-k2.5
+    role_command: scripts/dspy_role_driver.py
+    role_env:
+      OPENROUTER_API_KEY_ENV: OPEN_ROUTER_API_KEY
+      OPENROUTER_APP_TITLE: loopbench-team
+      OPENROUTER_HTTP_REFERER: https://localhost/loopbench
+      OPENROUTER_TEMPERATURE: "0.2"
+      OPENROUTER_MAX_TOKENS: "16384"
+      OPENROUTER_HTTP_TIMEOUT_SEC: "90"
+      OPENROUTER_HTTP_RETRIES: "4"
+
+rollouts_per_task: 1
+max_parallel_rollouts: 30
+available_agent_sandboxes: 100
+runtime_config: configs/runtime.e2b.openrouter.longrun.yaml

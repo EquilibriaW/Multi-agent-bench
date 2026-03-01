@@ -56,6 +56,11 @@ Coordination metrics recorded per rollout:
 - Add more tasks before adding more knobs.
 - Track failure causes (role bootstrap failures, merge failures, hidden validator failures) before policy changes.
 
+For high-concurrency E2B runs, tune these runtime knobs under `sandbox_backend.e2b`:
+- `max_concurrent_creates` to stagger sandbox startup and avoid burst creates.
+- `max_concurrent_syncs` to cap simultaneous upload/download tar syncs.
+- `create_timeout_sec` and `create_drain_timeout_sec` to allow queued startup under heavy load.
+
 ## Driver policy
 
 - Production lineups should use `driver: shell` with real role runtimes.

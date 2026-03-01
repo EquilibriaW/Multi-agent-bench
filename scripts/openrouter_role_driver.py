@@ -44,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1063,7 @@ def _run_agentic_loop(
     total_usage = _zero_usage_metadata()
     conversation_turns: List[Dict[str, Any]] = []
     last_turn = max_turns
+    last_response: Optional[Dict[str, Any]] = None
 
     for turn in range(1, max_turns + 1):
         last_turn = turn
@@ -1070,6 +1071,7 @@ def _run_agentic_loop(
         call_payload.pop("response_format", None)  # not compatible with tools
 
         response = _call_openrouter(payload=call_payload, api_key=api_key)
+        last_response = response
         _accumulate_usage(total_usage, response["usage"])
 
         choice = response["choice"]
@@ -1149,6 +1151,15 @@ def _run_agentic_loop(
                 )
             except Exception:  # noqa: BLE001
                 pass
+            # Write raw response text for tracing fallback
+            try:
+                _last_reply = last_response.get("reply_text", "") if last_response else ""
+                _write_text_file(
+                    _role_trace_path(output_path, "openrouter_response", ".txt"),
+                    _last_reply,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             return _build_agentic_output(
                 submit_args=submit_result,
                 all_tool_calls=all_tool_calls,
@@ -1178,6 +1189,15 @@ def _run_agentic_loop(
         _write_text_file(
             _role_trace_path(output_path, "conversation", ".txt"),
             _render_conversation_transcript(messages, conversation_turns, role, phase, model),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    # Write raw response text for tracing fallback
+    try:
+        _last_reply = last_response.get("reply_text", "") if last_response else ""
+        _write_text_file(
+            _role_trace_path(output_path, "openrouter_response", ".txt"),
+            _last_reply,
         )
     except Exception:  # noqa: BLE001
         pass

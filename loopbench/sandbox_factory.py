@@ -38,6 +38,9 @@ def build_sandbox(
             template=e2b_cfg.template,
             timeout_sec=e2b_cfg.timeout_sec,
             allow_internet_access=e2b_cfg.allow_internet_access,
+            max_concurrent_creates=e2b_cfg.max_concurrent_creates,
+            max_concurrent_syncs=e2b_cfg.max_concurrent_syncs,
+            init_command_timeout_sec=e2b_cfg.init_command_timeout_sec,
         )
         return E2BFirecrackerSandbox(sandbox_name=role, root=worktree_root, options=options)
 

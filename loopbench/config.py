@@ -19,6 +19,11 @@ class E2BBackendConfig(BaseModel):
     timeout_sec: int = 3600
     allow_internet_access: bool = False
     api_key_env: str = "E2B_API_KEY"
+    max_concurrent_creates: int = 12
+    max_concurrent_syncs: int = 24
+    create_timeout_sec: int = 1200
+    create_drain_timeout_sec: int = 90
+    init_command_timeout_sec: int = 240
 
 
 class SandboxBackendConfig(BaseModel):

@@ -7,6 +7,11 @@ sandbox_backend:
     timeout_sec: 3600
     allow_internet_access: true
     api_key_env: E2B_API_KEY
+    max_concurrent_creates: 12
+    max_concurrent_syncs: 24
+    create_timeout_sec: 1200
+    create_drain_timeout_sec: 90
+    init_command_timeout_sec: 240
 
 env_runner:
   kind: host_process

@@ -281,12 +281,17 @@ class DeterministicHarness(MultiAgentHarness):
         return subtasks
 
     def _collapse_overlapping_paths(self, subtasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """If multiple coders are assigned overlapping file paths, reassign all to one coder.
+        """If multiple coders are assigned overlapping *specific* file paths, reassign all to one coder.
 
         Two coders editing the same file guarantees cherry-pick merge conflicts.
+        Wildcard paths like "." or "tests" are ignored for overlap detection —
+        they're planning shortcuts, not real file-level conflicts.
         """
         if len(self.coders) < 2:
             return subtasks
+        # Broad/vague paths that planners use as shorthand — not real overlap signals.
+        _VAGUE_PATHS = {".", "tests", "test", "src", "lib", "app", "config"}
+
         paths_by_role: Dict[str, Set[str]] = {}
         for s in subtasks:
             role = str(s.get("role", ""))
@@ -297,23 +302,21 @@ class DeterministicHarness(MultiAgentHarness):
         if len(roles) < 2:
             return subtasks
 
-        # Check pairwise overlap.  "." means full-repo scope and overlaps
-        # with every other role's paths.
-        wildcard_roles = {r for r in roles if "." in paths_by_role.get(r, set())}
+        # Only check overlap on specific paths (not vague top-level dirs).
+        specific_by_role = {
+            r: {p for p in ps if p not in _VAGUE_PATHS}
+            for r, ps in paths_by_role.items()
+            if r in set(self.coders)
+        }
         has_overlap = False
-        if wildcard_roles and len(roles) >= 2:
-            # Any role with "." overlaps with all other roles
-            has_overlap = True
-        else:
-            specific_by_role = {r: {p for p in ps if p != "."} for r, ps in paths_by_role.items() if r in set(self.coders)}
-            role_list = list(specific_by_role.keys())
-            for i, r1 in enumerate(role_list):
-                for r2 in role_list[i + 1 :]:
-                    if specific_by_role[r1] & specific_by_role[r2]:
-                        has_overlap = True
-                        break
-                if has_overlap:
+        role_list = list(specific_by_role.keys())
+        for i, r1 in enumerate(role_list):
+            for r2 in role_list[i + 1:]:
+                if specific_by_role[r1] & specific_by_role[r2]:
+                    has_overlap = True
                     break
+            if has_overlap:
+                break
 
         if not has_overlap:
             return subtasks
@@ -329,7 +332,7 @@ class DeterministicHarness(MultiAgentHarness):
 
     def _implementation_phase(self, task: TaskPack, state: HarnessState) -> None:
         self.event_logger.begin_span("implementation", name="phase.implementation", tags=["phase", "implementation"])
-        planner_summary = self.artifacts.read_text(self.run_dir / "plans" / "plan.md")
+        planner_summary = self.artifacts.read_text(self.run_dir / "plans" / "plan.md")[:4000]
         phase_results = self._run_parallel_claim_phase(
             task=task,
             state=state,
@@ -410,6 +413,26 @@ class DeterministicHarness(MultiAgentHarness):
                 coders=self.coders,
                 candidate_merge_commits=candidate_merge_commits,
             )
+            # Include diffs from already-merged commits so the reviewer sees
+            # cumulative work, not just the latest rework delta.
+            if state.merged_commits:
+                already_merged_by_role = {
+                    coder: [c for c in planner_context["coder_commits"].get(coder, [])
+                            if c in state.merged_commits.get(coder, set())]
+                    for coder in self.coders
+                }
+                merged_candidate = build_candidate_merge_commits(
+                    role_paths=self.role_paths,
+                    coders=self.coders,
+                    coder_commits_by_role=already_merged_by_role,
+                )
+                merged_diffs = extract_inline_diffs(
+                    role_paths=self.role_paths,
+                    coders=self.coders,
+                    candidate_merge_commits=merged_candidate,
+                )
+                if merged_diffs:
+                    planner_context["already_merged_diffs"] = merged_diffs
             planner_context["review_diff_tool"] = build_review_diff_tool_context(
                 role_paths=self.role_paths,
                 planner=self.planner,
@@ -705,6 +728,7 @@ class DeterministicHarness(MultiAgentHarness):
                     decision="accept",
                     commits_merged=merged_commits_this_round,
                     open_issues=list(review_decision.coder_feedback.values()),
+                    coder_feedback_map=dict(review_decision.coder_feedback),
                     validation_passed=public_validation_passed,
                     merge_ok=merge_ok,
                     summary=str(planner_result.output.get("summary", "")),
@@ -739,6 +763,7 @@ class DeterministicHarness(MultiAgentHarness):
                     decision="rework",
                     commits_merged=merged_commits_this_round,
                     open_issues=list(review_decision.coder_feedback.values()),
+                    coder_feedback_map=dict(review_decision.coder_feedback),
                     validation_passed=public_validation_passed,
                     merge_ok=merge_ok,
                     summary=str(planner_result.output.get("summary", "")),
@@ -788,6 +813,7 @@ class DeterministicHarness(MultiAgentHarness):
                 decision="rework",
                 commits_merged=merged_commits_this_round,
                 open_issues=list(review_decision.coder_feedback.values()),
+                coder_feedback_map=dict(review_decision.coder_feedback),
                 validation_passed=public_validation_passed,
                 merge_ok=merge_ok,
                 summary=str(planner_result.output.get("summary", "")),
@@ -820,6 +846,17 @@ class DeterministicHarness(MultiAgentHarness):
         harness_issues: List[str] | None = None,
         span_id: str | None = None,
     ) -> ReviewDecision:
+        # Build coder_commits and inline_diffs so the verify driver can
+        # inspect actual diff content (same data the review-select phase gets).
+        coder_commits = {
+            coder: self._list_commits(coder, self.base_commit)
+            for coder in self.coders
+        }
+        verify_inline_diffs = extract_inline_diffs(
+            role_paths=self.role_paths,
+            coders=self.coders,
+            candidate_merge_commits=candidate_merge_commits,
+        )
         verify_context: Dict[str, Any] = {
             "task_id": task.task_id,
             "phase": "review_verify",
@@ -833,7 +870,37 @@ class DeterministicHarness(MultiAgentHarness):
             "review_ledger": self.ledger.as_context(),
             "candidate_merge_commits": candidate_merge_commits,
             "review_diff_tool": review_diff_tool,
+            "coder_commits": coder_commits,
+            "inline_diffs": verify_inline_diffs,
+            "implementation_messages": self._planner_review_messages(round_index=round_index),
+            "scratch_merge_results": self._scratch_merge_test(
+                state,
+                nominated_commits_by_role={
+                    coder: [c for c in coder_commits.get(coder, [])
+                            if c not in state.merged_commits[coder]]
+                    for coder in self.coders
+                },
+            ),
         }
+        # Add already_merged_diffs so verify sees cumulative state
+        if state.merged_commits:
+            already_merged_by_role = {
+                coder: [c for c in coder_commits.get(coder, [])
+                        if c in state.merged_commits.get(coder, set())]
+                for coder in self.coders
+            }
+            merged_candidate = build_candidate_merge_commits(
+                role_paths=self.role_paths,
+                coders=self.coders,
+                coder_commits_by_role=already_merged_by_role,
+            )
+            merged_diffs = extract_inline_diffs(
+                role_paths=self.role_paths,
+                coders=self.coders,
+                candidate_merge_commits=merged_candidate,
+            )
+            if merged_diffs:
+                verify_context["already_merged_diffs"] = merged_diffs
         if harness_issues:
             verify_context["harness_issues"] = harness_issues
         if self.knowledge is not None:
@@ -1054,6 +1121,8 @@ class DeterministicHarness(MultiAgentHarness):
         # context the coder has already seen — shrink it to keep feedback prominent.
         if round_index >= 2 and full_plan:
             planner_summary = full_plan[:500]
+        elif full_plan:
+            planner_summary = full_plan[:2000]
         else:
             planner_summary = full_plan
         phase_results = self._run_parallel_claim_phase(
@@ -1090,8 +1159,12 @@ class DeterministicHarness(MultiAgentHarness):
         state: Optional[HarnessState] = None,
         public_policy: str = "off",
     ) -> Dict[str, Any]:
+        raw_feedback = planner_feedback_by_role or {}
         ctx: Dict[str, Any] = {
-            "planner_feedback_by_role": planner_feedback_by_role or {},
+            "planner_feedback_by_role": {
+                role: feedback[:2000] for role, feedback in raw_feedback.items()
+                if isinstance(feedback, str)
+            },
         }
         # Only include validation output when it's actionable — i.e. validation
         # actually ran and produced meaningful output.  Raw build logs are capped
@@ -1419,6 +1492,11 @@ class DeterministicHarness(MultiAgentHarness):
             )
             if diff_result.ok and diff_result.stdout.strip():
                 context["own_diff"] = diff_result.stdout[:6000]
+        # Carry forward prior conversation so rework doesn't re-explore from scratch
+        if driver_phase == "rework":
+            prior_msgs = self._find_prior_conversation(role, round_index)
+            if prior_msgs is not None:
+                context["prior_conversation_messages"] = prior_msgs
         # Deploy knowledge_tool into the executing role's worktree so the
         # advertised command path resolves correctly for each coder.
         if self.knowledge is not None:
@@ -1427,6 +1505,59 @@ class DeterministicHarness(MultiAgentHarness):
                 knowledge_dir=self.run_dir / "knowledge",
             )
         return self._invoke_role(role, driver_phase, context, raise_on_failure=False, span_id=parent_span_id)
+
+    def _find_prior_conversation(self, role: str, round_index: int) -> list[dict] | None:
+        """Find conversation messages from the prior phase for this role.
+
+        For rework round 1, look for the last implementation conversation.
+        For rework round N>1, look for the most recent rework conversation (= round N-1).
+        Returns the raw messages list or None.
+        """
+        archive = self.run_dir / "role_runtime"
+        if not archive.is_dir():
+            return None
+
+        if round_index == 1:
+            pattern = f"{role}_implementation_*_conversation.json"
+        else:
+            pattern = f"{role}_rework_*_conversation.json"
+
+        candidates = sorted(archive.glob(pattern), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            return None
+
+        prior_path = candidates[-1]  # most recent
+        try:
+            conv = json.loads(prior_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+        # Prefer raw_messages (complete, ready to use) over reconstructed
+        raw = conv.get("raw_messages")
+        if raw and isinstance(raw, list) and len(raw) > 2:
+            messages = raw
+        else:
+            # Fallback: reconstruct from conversation structure
+            messages = []
+            sys_msg = conv.get("system_message")
+            usr_msg = conv.get("user_message")
+            if sys_msg:
+                messages.append(sys_msg)
+            if usr_msg:
+                messages.append(usr_msg)
+
+            for turn in conv.get("turns", []):
+                assistant_msg = turn.get("assistant_message")
+                if assistant_msg:
+                    messages.append(assistant_msg)
+                for tr in turn.get("tool_results", []):
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tr.get("tool_call_id", ""),
+                        "content": tr.get("content", ""),
+                    })
+
+        return messages if len(messages) > 2 else None
 
     def _scratch_merge_test(
         self,
@@ -1948,7 +2079,23 @@ class DeterministicHarness(MultiAgentHarness):
                 int(row.get("message_id", 0)) if isinstance(row.get("message_id"), int) else 0,
             )
         )
-        return merged[-120:]
+        _MAX_MSG_BODY = 500
+        _MAX_MSG_BODY_REWORK = 2000
+        for row in merged:
+            body = row.get("body", "")
+            if isinstance(body, dict):
+                # Structured body (rework_request etc.) — serialize and use higher limit
+                body = json.dumps(body, indent=2)
+                limit = _MAX_MSG_BODY_REWORK
+            elif isinstance(body, str):
+                # Check message type for rework requests
+                msg_type = row.get("type", "")
+                limit = _MAX_MSG_BODY_REWORK if msg_type == "rework_request" else _MAX_MSG_BODY
+            else:
+                continue
+            if len(body) > limit:
+                row["body"] = body[:limit] + "..."
+        return merged[-40:]
 
     def _resolve_symbolic_commit_token(self, role: str, token: str) -> Optional[str]:
         role_path = self.role_paths.get(role)
@@ -2001,8 +2148,8 @@ class DeterministicHarness(MultiAgentHarness):
             entry: Dict[str, Any] = {
                     "output_key": key,
                     "phase": str(output.get("phase") or ""),
-                    "summary": str(output.get("summary") or ""),
-                    "notes": str(output.get("notes") or ""),
+                    "summary": str(output.get("summary") or "")[:1000],
+                    "notes": str(output.get("notes") or "")[:1000],
                     "commit": output.get("commit"),
                     "applied_paths": output.get("applied_paths"),
                     "run_commands_attempted": output.get("run_commands_attempted"),
@@ -2015,7 +2162,21 @@ class DeterministicHarness(MultiAgentHarness):
                 if val:
                     entry[pr_key] = val
             out[coder].append(entry)
-        return {coder: outputs[-4:] for coder, outputs in out.items()}
+        def _compress_older(outputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            if len(outputs) <= 2:
+                return outputs
+            compressed = []
+            for entry in outputs[:-2]:
+                compressed.append({
+                    "output_key": entry.get("output_key"),
+                    "phase": entry.get("phase"),
+                    "summary": str(entry.get("summary", ""))[:200],
+                    "commit": entry.get("commit"),
+                    "failed_commands": entry.get("failed_commands", []),
+                })
+            return compressed + outputs[-2:]
+
+        return {coder: _compress_older(outputs[-4:]) for coder, outputs in out.items()}
 
     def _should_rebootstrap(self, state: HarnessState) -> bool:
         """Detect stuck loops: 3+ consecutive rework rounds with no new merges."""

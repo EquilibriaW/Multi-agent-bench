@@ -21,6 +21,7 @@ class ReviewLedgerEntry:
     decision: str  # "accept" | "rework"
     commits_merged: Dict[str, List[str]] = field(default_factory=dict)
     open_issues: List[str] = field(default_factory=list)
+    coder_feedback_map: Dict[str, str] = field(default_factory=dict)  # coder → feedback
     validation_passed: bool = False
     merge_ok: bool = True
     summary: str = ""
@@ -64,7 +65,7 @@ class ReviewLedger:
 
     @staticmethod
     def _serialize(entry: ReviewLedgerEntry) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "round_index": entry.round_index,
             "decision": entry.decision,
             "commits_merged": entry.commits_merged,
@@ -75,6 +76,9 @@ class ReviewLedger:
             "cause": entry.cause,
             "validation_stderr_tail": entry.validation_stderr_tail,
         }
+        if entry.coder_feedback_map:
+            d["coder_feedback_map"] = entry.coder_feedback_map
+        return d
 
 
 class RunArtifacts:
