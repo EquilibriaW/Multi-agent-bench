@@ -1733,6 +1733,9 @@ class DeterministicHarness(MultiAgentHarness):
                     if commit_sha:
                         result.output["commit"] = commit_sha
                         result.output["changed"] = True
+                # Emit driver_tool events from the conversation artifact so the
+                # canonical event stream reflects the agent's actual action space.
+                self._emit_driver_tool_events(role=role, phase=phase, span_id=span_id)
             else:
                 result.output = self._materialize_role_actions(
                     role=role,
@@ -1763,6 +1766,78 @@ class DeterministicHarness(MultiAgentHarness):
             )
 
         return result
+
+    def _emit_driver_tool_events(self, *, role: str, phase: str, span_id: str | None) -> None:
+        """Read conversation.json for this role/phase and emit driver_tool events.
+
+        This bridges the gap between the driver's local tool loop and the
+        harness event stream, making driver tool calls first-class in
+        events.jsonl, hodoscope exports, and aggregate telemetry.
+        """
+        rt_dir = self.run_dir / "role_runtime"
+        if not rt_dir.exists():
+            return
+
+        # Find conversation files matching this role and phase
+        pattern = f"{role}_{phase}_*_conversation.json"
+        conv_files = sorted(rt_dir.glob(pattern))
+        if not conv_files:
+            # Try without wildcard suffix for simpler naming conventions
+            pattern = f"{role}_{phase}_conversation.json"
+            conv_files = sorted(rt_dir.glob(pattern))
+
+        for conv_path in conv_files:
+            try:
+                conv = json.loads(conv_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            turns = conv.get("turns") or []
+            for turn in turns:
+                turn_idx = turn.get("turn", 0)
+                assistant = turn.get("assistant_message") or {}
+                tool_calls = assistant.get("tool_calls") or []
+                tool_results = turn.get("tool_results") or []
+
+                # Build result lookup by tool_call_id
+                result_by_id = {}
+                for tr in tool_results:
+                    tcid = tr.get("tool_call_id")
+                    if tcid:
+                        result_by_id[tcid] = tr
+
+                for tc in tool_calls:
+                    func = tc.get("function") or {}
+                    tool_name = func.get("name", "unknown")
+                    tc_id = tc.get("id", "")
+
+                    # Truncate args for the event (avoid bloating events.jsonl)
+                    args_raw = func.get("arguments", "{}")
+                    if isinstance(args_raw, str) and len(args_raw) > 500:
+                        args_summary = args_raw[:500] + "..."
+                    else:
+                        args_summary = args_raw
+
+                    # Get result summary
+                    tr = result_by_id.get(tc_id)
+                    result_content = (tr.get("content", "") if tr else "")
+                    if len(result_content) > 500:
+                        result_summary = result_content[:500] + "..."
+                    else:
+                        result_summary = result_content
+
+                    self.event_logger.log(
+                        "driver_tool",
+                        {
+                            "role": role,
+                            "phase": phase,
+                            "turn": turn_idx,
+                            "tool": tool_name,
+                            "args_summary": args_summary,
+                            "result_summary": result_summary,
+                        },
+                        span_id=span_id,
+                    )
 
     def _role_failure_message(self, *, role: str, phase: str, result: RoleRunResult) -> str:
         output_error = result.output.get("error") if isinstance(result.output, dict) else None

@@ -24,10 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_data_utils import (
     extract_context_summary,
+    extract_harness_design_metrics,
     extract_tool_usage_from_conversation,
+    load_ambiguity_reports,
     load_contexts,
     load_conversations,
     load_manifest,
+    load_review_audits,
     load_review_ledger,
     load_role_phases,
 )
@@ -219,6 +222,18 @@ def inspect(run_dir: Path, args: argparse.Namespace) -> dict:
     result["review_rounds"] = _build_review_summary(ledger)
     result["session_continuity"] = _build_continuity_report(conversations)
 
+    if args.tools:
+        audits = load_review_audits(run_dir)
+        ambiguity = load_ambiguity_reports(run_dir)
+        design = extract_harness_design_metrics(
+            conversations=conversations,
+            contexts=contexts,
+            audits=audits,
+            ledger=ledger,
+        )
+        design["ambiguity_reports"] = len(ambiguity)
+        result["harness_design"] = design
+
     return result
 
 
@@ -287,6 +302,31 @@ def _print_human(result: dict) -> None:
             print(f"  Round {r['round']}: {r['decision']}  merged={merged}  open_issues={issues}  val={r['validation_passed']}")
             if r.get("summary"):
                 print(f"    {r['summary'][:100]}")
+
+    hd = result.get("harness_design")
+    if hd:
+        print()
+        print("HARNESS DESIGN METRICS")
+        print("-" * 72)
+        dbsr = hd.get("docs_before_submit_rate")
+        print(f"  docs lookups: {hd.get('docs_lookup_count', 0)}", end="")
+        print(f", before_submit={dbsr:.1%}" if dbsr is not None else "")
+        su = hd.get("search_tool_uses", 0)
+        ge = hd.get("grep_via_exec", 0)
+        print(f"  search: {su} search_files, {ge} grep-via-exec")
+        mm = hd.get("malformed_merge_commits", 0)
+        un = hd.get("uninspected_nominations", 0)
+        print(f"  review: malformed_merges={mm}, uninspected_noms={un}")
+        rsr = hd.get("rework_salvage_rate")
+        print(f"  rework salvage: {hd.get('rework_with_writes', 0)}/{hd.get('rework_total', 0)}", end="")
+        print(f" ({rsr:.1%})" if rsr is not None else "")
+        fwt = hd.get("mean_first_write_turn")
+        fpr = hd.get("first_passing_validation_round")
+        print(f"  first write turn: {fwt:.1f}" if fwt is not None else "  first write turn: n/a")
+        print(f"  first passing round: {fpr}" if fpr is not None else "  first passing round: n/a")
+        ar = hd.get("ambiguity_reports", 0)
+        if ar:
+            print(f"  ambiguity reports: {ar}")
 
     cont = result.get("session_continuity", {})
     if cont.get("rework_phases_total", 0) > 0:

@@ -165,6 +165,22 @@ COMMON_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search_files",
+            "description": "Search file contents with regex. Returns matching lines with file paths and line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                    "path": {"type": "string", "description": "Directory to search in, relative to repo root (default: '.')"},
+                    "include": {"type": "string", "description": "Glob pattern to filter files (e.g. '*.py', '*.java')"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "exec",
             "description": "Run a shell command in the repo working directory",
             "parameters": {
@@ -196,6 +212,26 @@ COMMON_TOOLS: List[Dict[str, Any]] = [
                     "ref": {"type": "string", "description": "Git ref to diff against (default: HEAD)"}
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "report_ambiguity",
+            "description": "Report an ambiguity in the task, tools, or acceptance criteria. Use this when you encounter something unclear rather than guessing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["task_spec", "tool_affordance", "acceptance_criteria", "other"],
+                        "description": "Category of ambiguity",
+                    },
+                    "description": {"type": "string", "description": "What is ambiguous"},
+                    "attempted_resolution": {"type": "string", "description": "What you did instead of getting clarification"},
+                },
+                "required": ["category", "description"],
             },
         },
     },
@@ -817,7 +853,7 @@ def _build_review_verify_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any
     return "\n".join(parts)
 
 
-def _build_reflect_prompt(context: Dict[str, Any], repo_ctx: Dict[str, Any]) -> str:
+def _build_reflect_prompt(context: Dict[str, Any], _repo_ctx: Dict[str, Any]) -> str:
     round_num = context.get("round", "?")
 
     merged = context.get("merged_commits_this_round", {})
@@ -1000,7 +1036,7 @@ def _build_system_prompt(*, role: str, phase: str, context: Dict[str, Any]) -> s
     return base
 
 
-def _collect_repo_context(*, worktree: Path, context: Dict[str, Any]) -> Dict[str, Any]:
+def _collect_repo_context(*, worktree: Path, _context: Dict[str, Any]) -> Dict[str, Any]:
     task_readme = _safe_read_text(worktree / "public" / "README.task.md", max_chars=8000)
     if task_readme is None:
         task_readme = _safe_read_text(worktree / ".loopbench" / "public" / "README.task.md", max_chars=8000)
@@ -1114,7 +1150,7 @@ def _run_agentic_loop(
             result_text = _execute_tool(fn_name, fn_args, worktree, context, phase)
 
             if fn_name in ("git_show", "git_diff_files"):
-                _track_inspection(inspected_commits, fn_name, fn_args, context)
+                _track_inspection(inspected_commits, fn_args, context)
 
             messages.append({
                 "role": "tool",
@@ -1234,6 +1270,7 @@ def _build_agentic_output(
         "phase": phase,
         "model": model,
         "execution_mode": "agentic_tool_loop",
+        "openrouter_structured_valid": True,
         "openrouter_turn_count": turn_count,
         "openrouter_usage": total_usage,
         "coordination_phase": context.get("coordination_phase"),
@@ -1403,6 +1440,34 @@ def _execute_tool_inner(
         topic = fn_args.get("topic", "").lower().strip()
         return _lookup_docs(topic)
 
+    if fn_name == "report_ambiguity":
+        category = fn_args.get("category", "other")
+        description = fn_args.get("description", "")
+        resolution = fn_args.get("attempted_resolution", "")
+        # Write to ambiguity reports directory
+        import time as _time_mod
+        report = {
+            "ts": _time_mod.time(),
+            "role": context.get("role", "unknown"),
+            "phase": phase,
+            "category": category,
+            "description": description,
+            "attempted_resolution": resolution,
+        }
+        reports_dir = worktree / ".loopbench" / "ambiguity_reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_file = reports_dir / f"{int(_time_mod.time() * 1000)}.json"
+        report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        # Also write to run artifacts if available
+        run_dir_str = os.environ.get("LOOPBENCH_RUN_DIR", "")
+        if run_dir_str:
+            run_reports = Path(run_dir_str) / "ambiguity_reports"
+            run_reports.mkdir(parents=True, exist_ok=True)
+            (run_reports / report_file.name).write_text(
+                json.dumps(report, indent=2), encoding="utf-8"
+            )
+        return f"Ambiguity reported: [{category}] {description[:100]}"
+
     policy = _get_command_policy()
     default_timeout = policy["command_timeout_sec"]
 
@@ -1451,6 +1516,43 @@ def _execute_tool_inner(
             all_lines = all_lines[: int(limit)]
         content = "".join(all_lines)
         return _truncate_output(content)
+
+    if fn_name == "search_files":
+        pattern = fn_args.get("pattern", "")
+        if not pattern:
+            return "error: pattern is required"
+        raw_path = fn_args.get("path", ".")
+        target = _resolve_within_worktree(worktree, raw_path)
+        if not target.is_dir():
+            return f"error: not a directory: {raw_path}"
+        cmd = ["grep", "-rn", "--include=*", "-E", pattern, str(target)]
+        include = fn_args.get("include")
+        if include:
+            cmd = ["grep", "-rn", f"--include={include}", "-E", pattern, str(target)]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(worktree),
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return "error: search timed out"
+        if proc.returncode == 2:
+            return f"error: invalid pattern: {proc.stderr.strip()}"
+        output = proc.stdout
+        if not output.strip():
+            return "(no matches)"
+        # Make paths relative to worktree
+        worktree_prefix = str(worktree) + "/"
+        if worktree_prefix in output:
+            output = output.replace(worktree_prefix, "")
+        # Limit output
+        lines = output.splitlines()
+        if len(lines) > 100:
+            output = "\n".join(lines[:100]) + f"\n\n... [{len(lines) - 100} more matches truncated]"
+        return _truncate_output(output)
 
     if fn_name == "write_file":
         raw_path = fn_args.get("path", "")
@@ -1693,7 +1795,6 @@ def _truncate_output(text: str, *, max_chars: int = OUTPUT_TRUNCATE_CHARS) -> st
 
 def _track_inspection(
     inspected_commits: Dict[str, set],
-    fn_name: str,
     fn_args: Dict[str, Any],
     context: Dict[str, Any],
 ) -> None:
@@ -1730,10 +1831,6 @@ def _track_inspection(
 # ---------------------------------------------------------------------------
 # Kept utility functions
 # ---------------------------------------------------------------------------
-
-def _is_planner_review_phase(phase: str) -> bool:
-    phase_name = str(phase or "").strip().lower()
-    return phase_name in {"review", "review_verify"}
 
 
 def _reasoning_payload_from_env() -> Dict[str, Any] | None:
@@ -2046,22 +2143,7 @@ def _read_non_negative_int(*values: Any) -> int:
     return 0
 
 
-def _parse_json_object(text: str) -> Dict[str, Any]:
-    text = text.strip()
-    if not text:
-        return {}
-    candidates = [text]
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        candidates.append(m.group(0))
-    for candidate in candidates:
-        try:
-            data = json.loads(candidate)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            continue
-    return {}
+
 
 
 def _required_env(name: str) -> str:
@@ -2195,11 +2277,6 @@ def _role_trace_path(output_path: Path, suffix: str, extension: str) -> Path:
         stem = stem[:-7]
     return output_path.with_name(f"{stem}_{suffix}{extension}")
 
-
-def _safe_text(value: Any, fallback: str) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return fallback
 
 
 def _safe_read_text(path: Path, *, max_chars: int) -> str | None:

@@ -27,12 +27,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_data_utils import (
     extract_context_summary,
+    extract_harness_design_metrics,
     extract_tool_usage_from_conversation,
+    load_ambiguity_reports,
     load_contexts,
     load_conversations,
     load_manifest,
+    load_review_audits,
     load_review_ledger,
     load_role_phases,
+    normalize_tool_distribution,
 )
 
 
@@ -132,6 +136,17 @@ def _collect_run_data(run_dir: Path) -> dict | None:
         summary["file"] = stem
         ctx_metrics.append(summary)
 
+    audits = load_review_audits(run_dir)
+    ambiguity = load_ambiguity_reports(run_dir)
+
+    design_metrics = extract_harness_design_metrics(
+        conversations=conversations,
+        contexts=contexts,
+        audits=audits,
+        ledger=ledger,
+    )
+    design_metrics["ambiguity_reports"] = len(ambiguity)
+
     return {
         "run_dir": str(run_dir),
         "task_id": manifest.get("task_id"),
@@ -144,6 +159,7 @@ def _collect_run_data(run_dir: Path) -> dict | None:
         "conv_metrics": conv_metrics,
         "ctx_metrics": ctx_metrics,
         "ledger": ledger,
+        "design_metrics": design_metrics,
     }
 
 
@@ -186,7 +202,7 @@ def _build_model_summary(runs: list[dict]) -> dict:
                 for tool, count in cm["tool_distribution"].items():
                     tool_dist_total[tool] += count
                 anti_pattern_total += len(cm["anti_patterns"])
-                exec_total += cm["tool_distribution"].get("execute", 0)
+                exec_total += cm["tool_distribution"].get("execute", 0) + cm["tool_distribution"].get("exec", 0)
                 total_writes += cm["write_count"]
 
                 # Rework tracking
@@ -254,7 +270,7 @@ def _build_phase_summary(runs: list[dict]) -> dict:
             for tool, count in m["tool_distribution"].items():
                 tool_dist[tool] += count
             anti_count += len(m["anti_patterns"])
-            exec_count += m["tool_distribution"].get("execute", 0)
+            exec_count += m["tool_distribution"].get("execute", 0) + m["tool_distribution"].get("exec", 0)
             tokens_in.append(m["total_input_tokens"])
             tokens_out.append(m["total_output_tokens"])
 
@@ -339,6 +355,88 @@ def _build_failure_analysis(runs: list[dict]) -> dict:
     }
 
 
+def _build_design_metrics_summary(runs: list[dict]) -> dict:
+    """Aggregate harness-design metrics across runs."""
+    docs_lookups = 0
+    docs_before_submit = 0
+    total_submits = 0
+    search_uses = 0
+    grep_exec = 0
+    malformed_merge = 0
+    uninspected_nom = 0
+    no_dyn_check = 0
+    total_audit_rounds = 0
+    rework_total = 0
+    rework_salvaged = 0
+    first_write_turns: list[float] = []
+    first_pass_rounds: list[int] = []
+    ambiguity_count = 0
+
+    # Split by outcome for comparative analysis
+    pass_runs = [r for r in runs if r["hidden_pass"] is True]
+    fail_runs = [r for r in runs if r["hidden_pass"] is not True]
+
+    for run in runs:
+        dm = run.get("design_metrics") or {}
+        docs_lookups += dm.get("docs_lookup_count", 0)
+        search_uses += dm.get("search_tool_uses", 0)
+        grep_exec += dm.get("grep_via_exec", 0)
+        malformed_merge += dm.get("malformed_merge_commits", 0)
+        uninspected_nom += dm.get("uninspected_nominations", 0)
+        no_dyn_check += dm.get("no_dynamic_check", 0)
+        total_audit_rounds += dm.get("total_audit_rounds", 0)
+        rework_total += dm.get("rework_total", 0)
+        rework_salvaged += dm.get("rework_with_writes", 0)
+        ambiguity_count += dm.get("ambiguity_reports", 0)
+
+        fwt = dm.get("mean_first_write_turn")
+        if fwt is not None:
+            first_write_turns.append(fwt)
+
+        fpr = dm.get("first_passing_validation_round")
+        if fpr is not None:
+            first_pass_rounds.append(fpr)
+
+    # Count submits and docs-before-submit from conversations directly
+    for run in runs:
+        for cm in run["conv_metrics"]:
+            dist = cm["tool_distribution"]
+            if "submit" in dist:
+                total_submits += dist["submit"]
+
+    # Compute docs-before-submit for pass vs fail
+    docs_before_pass = sum(
+        (r.get("design_metrics") or {}).get("docs_lookup_count", 0) > 0
+        for r in pass_runs
+    )
+    docs_before_fail = sum(
+        (r.get("design_metrics") or {}).get("docs_lookup_count", 0) > 0
+        for r in fail_runs
+    )
+
+    return {
+        "docs_lookup_total": docs_lookups,
+        "docs_lookup_rate_pass": _ratio(docs_before_pass, len(pass_runs)) if pass_runs else None,
+        "docs_lookup_rate_fail": _ratio(docs_before_fail, len(fail_runs)) if fail_runs else None,
+        "search_tool_uses": search_uses,
+        "grep_via_exec": grep_exec,
+        "search_adoption": _ratio(search_uses, search_uses + grep_exec) if (search_uses + grep_exec) else None,
+        "total_audit_rounds": total_audit_rounds,
+        "malformed_merge_commits": malformed_merge,
+        "malformed_merge_rate": _ratio(malformed_merge, total_audit_rounds),
+        "uninspected_nominations": uninspected_nom,
+        "uninspected_nomination_rate": _ratio(uninspected_nom, total_audit_rounds),
+        "no_dynamic_check": no_dyn_check,
+        "no_dynamic_check_rate": _ratio(no_dyn_check, total_audit_rounds),
+        "rework_salvage_rate": _ratio(rework_salvaged, rework_total),
+        "rework_total": rework_total,
+        "rework_salvaged": rework_salvaged,
+        "mean_first_write_turn": _safe_mean(first_write_turns),
+        "mean_first_passing_round": _safe_mean(first_pass_rounds),
+        "ambiguity_reports": ambiguity_count,
+    }
+
+
 def generate_report(run_dirs: list[Path], model_breakdown: bool = False) -> dict:
     """Generate full aggregate report."""
     runs = []
@@ -365,6 +463,7 @@ def generate_report(run_dirs: list[Path], model_breakdown: bool = False) -> dict
     report["per_phase"] = _build_phase_summary(runs)
     report["review_pipeline"] = _build_review_summary(runs)
     report["failure_analysis"] = _build_failure_analysis(runs)
+    report["harness_design"] = _build_design_metrics_summary(runs)
 
     return report
 
@@ -436,6 +535,45 @@ def _print_human(report: dict) -> None:
         print(f"  total failures: {fa['total_failures']}")
         for bucket, count in fa.get("buckets", {}).items():
             print(f"    {bucket}: {count}")
+
+    hd = report.get("harness_design", {})
+    if hd:
+        print()
+        print("HARNESS DESIGN METRICS")
+        print("-" * 72)
+        # Progressive disclosure
+        dl = hd.get("docs_lookup_total", 0)
+        dlp = hd.get("docs_lookup_rate_pass")
+        dlf = hd.get("docs_lookup_rate_fail")
+        print(f"  docs lookups: {dl} total", end="")
+        print(f", pass_runs={dlp:.1%}" if dlp is not None else "", end="")
+        print(f", fail_runs={dlf:.1%}" if dlf is not None else "")
+        # Search adoption
+        su = hd.get("search_tool_uses", 0)
+        ge = hd.get("grep_via_exec", 0)
+        sa = hd.get("search_adoption")
+        print(f"  search: {su} search_files, {ge} grep-via-exec", end="")
+        print(f", adoption={sa:.1%}" if sa is not None else "")
+        # Review quality
+        mm = hd.get("malformed_merge_commits", 0)
+        mmr = hd.get("malformed_merge_rate", 0)
+        un = hd.get("uninspected_nominations", 0)
+        unr = hd.get("uninspected_nomination_rate", 0)
+        print(f"  review quality: malformed_merges={mm} ({mmr:.1%}), uninspected_noms={un} ({unr:.1%})")
+        # Rework effectiveness
+        rt = hd.get("rework_total", 0)
+        rs = hd.get("rework_salvaged", 0)
+        rsr = hd.get("rework_salvage_rate", 0)
+        print(f"  rework salvage: {rs}/{rt} ({rsr:.1%})")
+        # Timing
+        fwt = hd.get("mean_first_write_turn")
+        fpr = hd.get("mean_first_passing_round")
+        print(f"  mean first write turn: {fwt:.1f}" if fwt is not None else "  mean first write turn: n/a")
+        print(f"  mean first passing round: {fpr:.1f}" if fpr is not None else "  mean first passing round: n/a")
+        # Ambiguity
+        ar = hd.get("ambiguity_reports", 0)
+        if ar:
+            print(f"  ambiguity reports: {ar}")
 
 
 def main() -> None:

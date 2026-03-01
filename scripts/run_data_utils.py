@@ -191,6 +191,199 @@ _EXEC_ANTI_PATTERNS: list[tuple[str, list[str]]] = [
 ]
 
 
+def load_review_audits(run_dir: Path) -> list[dict]:
+    """Load review audit JSON files from artifacts/review_audit/."""
+    audit_dir = run_dir / "artifacts" / "review_audit"
+    if not audit_dir.exists():
+        return []
+    audits = []
+    for p in sorted(audit_dir.glob("round_*.json")):
+        try:
+            audits.append(json.loads(p.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return audits
+
+
+def load_driver_tool_events(run_dir: Path) -> list[dict]:
+    """Parse events.jsonl, return list of driver_tool event payloads."""
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        return []
+    events = []
+    with events_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event.get("type") != "driver_tool":
+                continue
+            payload = event.get("payload") or {}
+            payload["_ts_ms"] = event.get("ts_ms")
+            events.append(payload)
+    return events
+
+
+def load_ambiguity_reports(run_dir: Path) -> list[dict]:
+    """Load ambiguity report JSONs if present."""
+    reports_dir = run_dir / "ambiguity_reports"
+    if not reports_dir.exists():
+        return []
+    reports = []
+    for p in sorted(reports_dir.glob("*.json")):
+        try:
+            reports.append(json.loads(p.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            continue
+    return reports
+
+
+def extract_harness_design_metrics(
+    conversations: dict[str, dict],
+    contexts: dict[str, dict],
+    audits: list[dict],
+    ledger: list[dict],
+) -> dict:
+    """Extract harness-design metrics from run artifacts.
+
+    These measure how well the harness affordances serve the agent,
+    not just what the agent produced.
+    """
+    # 1. Docs lookup before submit: did agent use lookup_docs/knowledge_tool?
+    docs_lookups = 0
+    total_submits = 0
+    docs_before_submit = 0
+
+    # 2. Time to first write (turn index of first write_file/apply_patch)
+    first_write_turns: list[int] = []
+
+    # 3. Search tool usage vs grep-via-exec
+    search_tool_uses = 0
+    grep_via_exec = 0
+
+    for _stem, conv in conversations.items():
+        turns = conv.get("turns") or []
+        found_docs = False
+        found_write = False
+
+        for turn in turns:
+            assistant = turn.get("assistant_message") or {}
+            tool_calls = assistant.get("tool_calls") or []
+            for tc in tool_calls:
+                func = tc.get("function") or {}
+                name = func.get("name", "")
+
+                if name in ("lookup_docs", "knowledge_tool"):
+                    docs_lookups += 1
+                    found_docs = True
+
+                if name == "search_files":
+                    search_tool_uses += 1
+
+                if name in ("exec", "execute"):
+                    args_str = func.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    cmd = (args.get("command", "") if isinstance(args, dict) else "").strip()
+                    if cmd.startswith("grep ") or cmd.startswith("rg "):
+                        grep_via_exec += 1
+
+                if name in ("write_file", "apply_patch", "create_file") and not found_write:
+                    found_write = True
+                    first_write_turns.append(turn.get("turn", 0))
+
+                if name == "submit":
+                    total_submits += 1
+                    if found_docs:
+                        docs_before_submit += 1
+
+    # 4. Review audit metrics
+    malformed_merge_commits = 0
+    uninspected_nominations = 0
+    no_dynamic_check = 0
+    total_review_rounds = len(audits)
+
+    for audit in audits:
+        # Malformed merge_commits
+        if audit.get("request_rework") is False and not audit.get("merge_ok", True):
+            malformed_merge_commits += 1
+
+        # Uninspected nominations
+        uninspected = audit.get("uninspected_nominated_commits_by_role") or {}
+        if any(commits for commits in uninspected.values()):
+            uninspected_nominations += 1
+
+        # No dynamic check
+        if not audit.get("review_dynamic_checks_ran", True):
+            no_dynamic_check += 1
+
+    # 5. Rework salvage rate (from conversations)
+    rework_total = 0
+    rework_with_commit = 0
+    for _stem, conv in conversations.items():
+        phase = conv.get("phase", "")
+        if "rework" not in phase:
+            continue
+        rework_total += 1
+        usage = extract_tool_usage_from_conversation(conv)
+        if usage["write_count"] > 0:
+            rework_with_commit += 1
+
+    # 6. Time to first passing validation (from ledger)
+    first_pass_round: int | None = None
+    for entry in ledger:
+        if entry.get("validation_passed"):
+            first_pass_round = entry.get("round_index", 0) + 1
+            break
+
+    return {
+        "docs_lookup_count": docs_lookups,
+        "docs_before_submit_rate": docs_before_submit / total_submits if total_submits else None,
+        "search_tool_uses": search_tool_uses,
+        "grep_via_exec": grep_via_exec,
+        "search_vs_exec_ratio": search_tool_uses / (search_tool_uses + grep_via_exec) if (search_tool_uses + grep_via_exec) else None,
+        "total_audit_rounds": total_review_rounds,
+        "malformed_merge_commits": malformed_merge_commits,
+        "malformed_merge_rate": malformed_merge_commits / total_review_rounds if total_review_rounds else None,
+        "uninspected_nominations": uninspected_nominations,
+        "uninspected_nomination_rate": uninspected_nominations / total_review_rounds if total_review_rounds else None,
+        "no_dynamic_check": no_dynamic_check,
+        "no_dynamic_check_rate": no_dynamic_check / total_review_rounds if total_review_rounds else None,
+        "rework_salvage_rate": rework_with_commit / rework_total if rework_total else None,
+        "rework_total": rework_total,
+        "rework_with_writes": rework_with_commit,
+        "mean_first_write_turn": sum(first_write_turns) / len(first_write_turns) if first_write_turns else None,
+        "first_passing_validation_round": first_pass_round,
+        "ambiguity_reports": 0,  # populated by caller if available
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool name normalization
+# ---------------------------------------------------------------------------
+
+# Canonical tool names — maps driver-specific names to canonical form
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    "execute": "exec",
+}
+
+
+def normalize_tool_name(name: str) -> str:
+    """Normalize tool name to canonical form."""
+    return _TOOL_NAME_ALIASES.get(name, name)
+
+
+def normalize_tool_distribution(dist: dict[str, int]) -> dict[str, int]:
+    """Normalize all tool names in a distribution dict."""
+    normalized: dict[str, int] = {}
+    for name, count in dist.items():
+        canonical = normalize_tool_name(name)
+        normalized[canonical] = normalized.get(canonical, 0) + count
+    return normalized
+
+
 def classify_anti_pattern(tool_name: str, args: dict) -> str | None:
     """Return anti-pattern label if exec/execute duplicates a dedicated tool.
 
