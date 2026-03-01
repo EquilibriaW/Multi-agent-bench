@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shlex
 import sys
 import tarfile
@@ -158,7 +159,9 @@ def run_benchmark(
                 ): role
                 for role in roles
             }
-            done, not_done = futures_wait(futs, timeout=_SANDBOX_CREATE_TIMEOUT_SEC, return_when=FIRST_EXCEPTION)
+            create_timeout_sec = _sandbox_create_timeout_seconds(runtime_cfg)
+            create_drain_timeout_sec = _sandbox_create_drain_timeout_seconds(runtime_cfg)
+            done, not_done = futures_wait(futs, timeout=create_timeout_sec, return_when=FIRST_EXCEPTION)
 
             # Collect ALL successful results first so their sandboxes
             # enter the dict (and thus get cleaned up by the outer finally).
@@ -201,7 +204,7 @@ def run_benchmark(
 
                 # Allow already-running futures a short drain window so we
                 # can close sandboxes created after timeout and avoid leaks.
-                drain_deadline = time.monotonic() + _SANDBOX_DRAIN_TIMEOUT_SEC
+                drain_deadline = time.monotonic() + create_drain_timeout_sec
                 pending = set(not_done)
                 while pending and time.monotonic() < drain_deadline:
                     remaining = drain_deadline - time.monotonic()
@@ -220,7 +223,7 @@ def run_benchmark(
                 if first_exc is not None:
                     raise first_exc
                 raise RuntimeError(
-                    f"sandbox creation timed out after {_SANDBOX_CREATE_TIMEOUT_SEC}s "
+                    f"sandbox creation timed out after {create_timeout_sec}s "
                     f"({len(not_done)} of {len(futs)} roles stalled)"
                 )
 
@@ -449,6 +452,7 @@ def replay_events(run_dir: str) -> Dict[str, Any]:
     log_queries = 0
     metric_queries = 0
     role_phase_failures = 0
+    per_role_phases: Dict[str, list] = {}
 
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
@@ -473,6 +477,22 @@ def replay_events(run_dir: str) -> Dict[str, Any]:
                 payload = event.get("payload") or {}
                 if payload.get("ok") is False:
                     role_phase_failures += 1
+                output = payload.get("output") or {}
+                role = payload.get("role", "unknown")
+                phase = payload.get("phase", "unknown")
+                entry = {
+                    "role": role,
+                    "phase": phase,
+                    "model": output.get("model"),
+                    "turns": output.get("openrouter_turn_count"),
+                    "files_changed": output.get("files_changed", []),
+                    "summary": output.get("summary", ""),
+                }
+                usage = output.get("openrouter_usage") or {}
+                if usage:
+                    entry["input_tokens"] = usage.get("input_tokens") or usage.get("prompt_tokens", 0)
+                    entry["output_tokens"] = usage.get("output_tokens") or usage.get("completion_tokens", 0)
+                per_role_phases.setdefault(role, []).append(entry)
 
     return {
         "event_counts": counts,
@@ -482,6 +502,7 @@ def replay_events(run_dir: str) -> Dict[str, Any]:
         "log_queries_used": log_queries,
         "metric_queries_used": metric_queries,
         "role_phase_failures": role_phase_failures,
+        "per_role_phases": per_role_phases,
         "events_path": str(path),
     }
 
@@ -890,7 +911,7 @@ def _create_role_infra(
             if cancel_event is not None and cancel_event.is_set():
                 raise _SandboxInitCancelled(f"sandbox init cancelled for role '{role}'") from exc
             if attempt < _SANDBOX_CREATE_MAX_ATTEMPTS:
-                backoff_sec = 2 ** attempt
+                backoff_sec = (2 ** attempt) + random.uniform(0.0, 0.75)
                 if cancel_event is not None:
                     if cancel_event.wait(timeout=backoff_sec):
                         raise _SandboxInitCancelled(f"sandbox init cancelled for role '{role}'") from exc
@@ -957,3 +978,15 @@ def _teardown_substrates(substrates: Dict[str, Any]) -> None:
 
     for t in threads:
         t.join(timeout=_SUBSTRATE_TEARDOWN_TIMEOUT_SEC + 10)
+
+
+def _sandbox_create_timeout_seconds(runtime_cfg: RuntimeConfig) -> int:
+    if runtime_cfg.sandbox_backend.kind == "e2b_firecracker":
+        return max(60, int(runtime_cfg.sandbox_backend.e2b.create_timeout_sec))
+    return _SANDBOX_CREATE_TIMEOUT_SEC
+
+
+def _sandbox_create_drain_timeout_seconds(runtime_cfg: RuntimeConfig) -> int:
+    if runtime_cfg.sandbox_backend.kind == "e2b_firecracker":
+        return max(10, int(runtime_cfg.sandbox_backend.e2b.create_drain_timeout_sec))
+    return _SANDBOX_DRAIN_TIMEOUT_SEC

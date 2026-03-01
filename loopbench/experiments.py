@@ -80,6 +80,10 @@ class RolloutRecord:
     failure_bucket: Optional[str]
     failure_reason: Optional[str]
     manifest_path: Optional[str]
+    coder_model: Optional[str] = None
+    planner_model: Optional[str] = None
+    per_role_turns: Optional[Dict[str, int]] = None
+    per_role_tokens: Optional[Dict[str, int]] = None
 
 
 def load_experiment_spec(path: str | Path) -> ExperimentSpec:
@@ -208,6 +212,7 @@ def run_experiment(
             kill_all_active_sandboxes()
 
     summary = _summarize_records(records)
+    by_model_summary = _summarize_by_model(records)
     summary_payload = {
         "experiment_id": spec.experiment_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -218,6 +223,8 @@ def run_experiment(
         "sandbox_headroom": _sandbox_headroom(spec.available_agent_sandboxes, spec.max_parallel_rollouts * 3),
         "summary": summary,
     }
+    if by_model_summary:
+        summary_payload["summary_by_model"] = by_model_summary
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
     feedback_path.write_text(_render_feedback(summary_payload, records), encoding="utf-8")
 
@@ -298,7 +305,27 @@ def _run_rollout_job(
                 "log_queries_used": None,
                 "metric_queries_used": None,
                 "role_phase_failures": None,
+                "per_role_phases": {},
             }
+
+        # Extract per-role model/turns/tokens from enriched replay_events
+        per_role_phases = extra.get("per_role_phases") or {}
+        coder_model_val = None
+        planner_model_val = None
+        per_role_turns_val: Dict[str, int] = {}
+        per_role_tokens_val: Dict[str, int] = {}
+        for role, phases in per_role_phases.items():
+            role_turns = sum(p.get("turns") or 0 for p in phases)
+            role_tokens = sum((p.get("input_tokens") or 0) + (p.get("output_tokens") or 0) for p in phases)
+            per_role_turns_val[role] = role_turns
+            per_role_tokens_val[role] = role_tokens
+            if phases:
+                model = phases[0].get("model")
+                if model:
+                    if role.startswith("coder") and coder_model_val is None:
+                        coder_model_val = model
+                    elif "planner" in role and planner_model_val is None:
+                        planner_model_val = model
         hidden_infra_error = bool(manifest.metrics.get("hidden_infra_error"))
         status = "infra_error" if hidden_infra_error else "ok"
         failure_bucket = _infer_failure_bucket(
@@ -334,6 +361,10 @@ def _run_rollout_job(
             failure_bucket=failure_bucket,
             failure_reason=failure_reason,
             manifest_path=str(run_dir / "manifest.json"),
+            coder_model=coder_model_val,
+            planner_model=planner_model_val,
+            per_role_turns=per_role_turns_val or None,
+            per_role_tokens=per_role_tokens_val or None,
         )
     except Exception as exc:  # noqa: BLE001
         reason = str(exc)
@@ -401,7 +432,7 @@ def _write_agents_config_for_lineup(*, experiment_dir: Path, lineup: LineupSpec)
         "roles": roles,
         "scheduling": {
             "mode": "phased",
-            "max_review_rounds": 3,
+            "max_review_rounds": 6,
             "phases": [
                 {"name": "bootstrap", "active_roles": ["planner_reviewer"], "exit_condition": "plan_written"},
                 {"name": "implementation", "active_roles": ["coder_a", "coder_b"], "exit_condition": "coders_done"},
@@ -560,6 +591,83 @@ def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
             fh.write(line)
 
 
+def _summarize_lineup_group(recs: List[RolloutRecord]) -> Dict[str, Any]:
+    """Compute summary metrics for a group of RolloutRecords."""
+    n = len(recs)
+    n_ok = sum(1 for r in recs if r.status == "ok")
+    hidden_passes = sum(1 for r in recs if r.status == "ok" and r.hidden_pass is True)
+    public_passes = sum(1 for r in recs if r.status == "ok" and r.public_pass is True)
+
+    wall = [r.wall_clock_sec for r in recs if r.wall_clock_sec is not None]
+    reviews = [r.review_iterations for r in recs if r.review_iterations is not None]
+    conflicts = [r.merge_conflicts for r in recs if r.merge_conflicts is not None]
+    tool_calls = [r.tool_calls for r in recs if r.tool_calls is not None]
+    env_cycles = [r.env_cycles_used for r in recs if r.env_cycles_used is not None]
+    role_phase_failures = [r.role_phase_failures for r in recs if r.role_phase_failures is not None]
+    coord_messages = [r.coordination_messages_total for r in recs if r.coordination_messages_total is not None]
+    coord_claims = [r.coordination_claim_events_total for r in recs if r.coordination_claim_events_total is not None]
+    coord_tasks_completed = [r.coordination_tasks_completed for r in recs if r.coordination_tasks_completed is not None]
+    coord_tasks_failed = [r.coordination_tasks_failed for r in recs if r.coordination_tasks_failed is not None]
+
+    failure_counter = Counter(
+        normalize_error(r.failure_reason)
+        for r in recs
+        if ((r.status != "ok") or (r.hidden_pass is False)) and r.failure_reason
+    )
+    bucket_counter = Counter(
+        r.failure_bucket or "unknown"
+        for r in recs
+        if (r.status != "ok") or (r.hidden_pass is False)
+    )
+
+    pressure_index = []
+    for r in recs:
+        if r.review_iterations is None or r.merge_conflicts is None or r.env_cycles_used is None:
+            continue
+        pressure_index.append(r.review_iterations + r.merge_conflicts + r.env_cycles_used)
+
+    first_rollouts = [r for r in recs if r.rollout_index == 1]
+    pass_at_1_evaluable = sum(1 for r in first_rollouts if r.status != "infra_error")
+    pass_at_1_passes = sum(1 for r in first_rollouts if r.status == "ok" and r.hidden_pass is True)
+    pass_at_1_infra = sum(1 for r in first_rollouts if r.status == "infra_error")
+
+    time_thresholds = [1200, 2400, 3600]
+    pass_at_1_by_time = {}
+    for threshold in time_thresholds:
+        passes_within = sum(
+            1 for r in first_rollouts
+            if r.status == "ok"
+            and r.hidden_pass is True
+            and r.wall_clock_sec is not None
+            and r.wall_clock_sec <= threshold
+        )
+        pass_at_1_by_time[f"pass_at_1_{threshold}s"] = _ratio(passes_within, pass_at_1_evaluable)
+
+    return {
+        "n_rollouts": n,
+        "n_evaluable": n_ok,
+        "run_completion_rate": _ratio(n_ok, n),
+        "pass_at_1": _ratio(pass_at_1_passes, pass_at_1_evaluable),
+        "pass_at_1_by_time": pass_at_1_by_time,
+        "pass_at_1_infra_excluded": pass_at_1_infra,
+        "hidden_pass_rate": _ratio(hidden_passes, n_ok),
+        "public_pass_rate": _ratio(public_passes, n_ok),
+        "median_wall_clock_sec": _median_or_none(wall),
+        "mean_review_iterations": _mean_or_none(reviews),
+        "mean_merge_conflicts": _mean_or_none(conflicts),
+        "mean_tool_calls": _mean_or_none(tool_calls),
+        "mean_env_cycles_used": _mean_or_none(env_cycles),
+        "mean_role_phase_failures": _mean_or_none(role_phase_failures),
+        "mean_coordination_messages_total": _mean_or_none(coord_messages),
+        "mean_coordination_claim_events_total": _mean_or_none(coord_claims),
+        "mean_coordination_tasks_completed": _mean_or_none(coord_tasks_completed),
+        "mean_coordination_tasks_failed": _mean_or_none(coord_tasks_failed),
+        "coordination_pressure_index_mean": _mean_or_none(pressure_index),
+        "failure_buckets": dict(bucket_counter),
+        "top_failures": failure_counter.most_common(8),
+    }
+
+
 def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
     by_lineup: Dict[str, List[RolloutRecord]] = defaultdict(list)
     for rec in records:
@@ -568,84 +676,31 @@ def _summarize_records(records: List[RolloutRecord]) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
 
     for lineup, recs in by_lineup.items():
-        n = len(recs)
-        n_ok = sum(1 for r in recs if r.status == "ok")
-        hidden_passes = sum(1 for r in recs if r.status == "ok" and r.hidden_pass is True)
-        public_passes = sum(1 for r in recs if r.status == "ok" and r.public_pass is True)
-
-        wall = [r.wall_clock_sec for r in recs if r.wall_clock_sec is not None]
-        reviews = [r.review_iterations for r in recs if r.review_iterations is not None]
-        conflicts = [r.merge_conflicts for r in recs if r.merge_conflicts is not None]
-        tool_calls = [r.tool_calls for r in recs if r.tool_calls is not None]
-        env_cycles = [r.env_cycles_used for r in recs if r.env_cycles_used is not None]
-        role_phase_failures = [r.role_phase_failures for r in recs if r.role_phase_failures is not None]
-        coord_messages = [r.coordination_messages_total for r in recs if r.coordination_messages_total is not None]
-        coord_claims = [r.coordination_claim_events_total for r in recs if r.coordination_claim_events_total is not None]
-        coord_tasks_completed = [r.coordination_tasks_completed for r in recs if r.coordination_tasks_completed is not None]
-        coord_tasks_failed = [r.coordination_tasks_failed for r in recs if r.coordination_tasks_failed is not None]
-
-        failure_counter = Counter(
-            normalize_error(r.failure_reason)
-            for r in recs
-            if ((r.status != "ok") or (r.hidden_pass is False)) and r.failure_reason
-        )
-        bucket_counter = Counter(
-            r.failure_bucket or "unknown"
-            for r in recs
-            if (r.status != "ok") or (r.hidden_pass is False)
-        )
-
-        pressure_index = []
-        for r in recs:
-            if r.review_iterations is None or r.merge_conflicts is None or r.env_cycles_used is None:
-                continue
-            pressure_index.append(r.review_iterations + r.merge_conflicts + r.env_cycles_used)
-
-        # pass@1: first-attempt success rate per task (ABC bench compatible)
-        # Denominator excludes infra errors (our fault, not the agent's) but
-        # includes timeouts (agent exceeded resource allocation = legitimate failure).
-        first_rollouts = [r for r in recs if r.rollout_index == 1]
-        pass_at_1_evaluable = sum(1 for r in first_rollouts if r.status != "infra_error")
-        pass_at_1_passes = sum(1 for r in first_rollouts if r.status == "ok" and r.hidden_pass is True)
-        pass_at_1_infra = sum(1 for r in first_rollouts if r.status == "infra_error")
-
-        time_thresholds = [1200, 2400, 3600]
-        pass_at_1_by_time = {}
-        for threshold in time_thresholds:
-            passes_within = sum(
-                1 for r in first_rollouts
-                if r.status == "ok"
-                and r.hidden_pass is True
-                and r.wall_clock_sec is not None
-                and r.wall_clock_sec <= threshold
-            )
-            pass_at_1_by_time[f"pass_at_1_{threshold}s"] = _ratio(passes_within, pass_at_1_evaluable)
-
-        summary[lineup] = {
-            "n_rollouts": n,
-            "n_evaluable": n_ok,
-            "run_completion_rate": _ratio(n_ok, n),
-            "pass_at_1": _ratio(pass_at_1_passes, pass_at_1_evaluable),
-            "pass_at_1_by_time": pass_at_1_by_time,
-            "pass_at_1_infra_excluded": pass_at_1_infra,
-            "hidden_pass_rate": _ratio(hidden_passes, n_ok),
-            "public_pass_rate": _ratio(public_passes, n_ok),
-            "median_wall_clock_sec": _median_or_none(wall),
-            "mean_review_iterations": _mean_or_none(reviews),
-            "mean_merge_conflicts": _mean_or_none(conflicts),
-            "mean_tool_calls": _mean_or_none(tool_calls),
-            "mean_env_cycles_used": _mean_or_none(env_cycles),
-            "mean_role_phase_failures": _mean_or_none(role_phase_failures),
-            "mean_coordination_messages_total": _mean_or_none(coord_messages),
-            "mean_coordination_claim_events_total": _mean_or_none(coord_claims),
-            "mean_coordination_tasks_completed": _mean_or_none(coord_tasks_completed),
-            "mean_coordination_tasks_failed": _mean_or_none(coord_tasks_failed),
-            "coordination_pressure_index_mean": _mean_or_none(pressure_index),
-            "failure_buckets": dict(bucket_counter),
-            "top_failures": failure_counter.most_common(8),
-        }
+        summary[lineup] = _summarize_lineup_group(recs)
 
     return summary
+
+
+def _summarize_by_model(records: List[RolloutRecord]) -> Dict[str, Any] | None:
+    """Group records by coder_model and summarize each group.
+
+    Returns None if all records fall into a single group identical to
+    the lineup grouping (no additional insight from model breakdown).
+    """
+    by_model: Dict[str, List[RolloutRecord]] = defaultdict(list)
+    for rec in records:
+        model_key = rec.coder_model or rec.lineup
+        by_model[model_key].append(rec)
+
+    # Skip if model grouping is identical to lineup grouping
+    by_lineup_keys = {rec.lineup for rec in records}
+    if set(by_model.keys()) == by_lineup_keys:
+        return None
+
+    return {
+        model: _summarize_lineup_group(recs)
+        for model, recs in by_model.items()
+    }
 
 
 def _render_feedback(summary_payload: Dict[str, Any], records: List[RolloutRecord]) -> str:
