@@ -1869,11 +1869,18 @@ class DeterministicHarness(MultiAgentHarness):
             return
         dst_dir = self.run_dir / "ambiguity_reports"
         dst_dir.mkdir(parents=True, exist_ok=True)
+        src_dir_resolved = src_dir.resolve()
         for src in src_dir.iterdir():
-            if src.is_file() and src.suffix == ".json":
-                dst = dst_dir / src.name
-                if not dst.exists():
-                    shutil.copy2(src, dst)
+            if src.is_symlink():
+                continue  # reject symlinks to prevent sandbox escape
+            if not src.is_file() or src.suffix != ".json":
+                continue
+            # Verify resolved path stays under src_dir
+            if not src.resolve().is_relative_to(src_dir_resolved):
+                continue
+            dst = dst_dir / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
 
     def _role_failure_message(self, *, role: str, phase: str, result: RoleRunResult) -> str:
         output_error = result.output.get("error") if isinstance(result.output, dict) else None
