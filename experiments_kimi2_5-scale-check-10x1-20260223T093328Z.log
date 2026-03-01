@@ -1,9 +1,0 @@
-[loopbench] preflight: all required API keys present (OpenRouter, E2B=e2b_firecracker, tracing=langsmith)
-[loopbench] 1/10 (335s) task_nhost_hasura_auth__authentication -> fail
-[loopbench] 2/10 (838s) task_devmentors_packit__packing_lists -> INFRA (707s)
-[loopbench] 3/10 (1451s) task_ttulka_ddd_example_ecommerce__shipping_delivery_api -> fail (1394s)
-[loopbench] 4/10 (1656s) task_flippercloud_flipper__actor_targeting -> INFRA (1408s)
-[loopbench] 5/10 (1656s) task_stripe_samples_accept_a_payment__payment_lifecycle -> fail (1507s)
-[loopbench] 6/10 (1842s) task_1chz_realworld_java21_springboot3__articles -> fail (1762s)
-[loopbench] 7/10 (2244s) task_laqul_laqul__graphql_api -> INFRA (1960s)
-[loopbench] SIGTERM received, shutting down...

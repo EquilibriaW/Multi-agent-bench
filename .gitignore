@@ -20,6 +20,8 @@ workspaces/
 caches/
 .tmp/
 experiments/
+experiments_*.log
+extracted/
 
 # Conda/miniconda local installs
 .conda/

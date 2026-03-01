@@ -1,7 +1,0 @@
-[loopbench] preflight: all required API keys present (OpenRouter, E2B=e2b_firecracker, tracing=langsmith)
-[loopbench] 1/10 (183s) task_rubygems_rubygems_org__compact_index -> INFRA
-Response 404
-Response 404
-Response 404
-[loopbench] 2/10 (269s) task_stripe_samples_accept_a_payment__payment_lifecycle -> fail (145s)
-[loopbench] 3/10 (301s) task_nhost_hasura_auth__authentication -> fail
