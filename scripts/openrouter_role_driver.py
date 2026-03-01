@@ -1459,7 +1459,7 @@ def _execute_tool_inner(
         report_file = reports_dir / f"{int(_time_mod.time() * 1000)}.json"
         report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
         # Also write to run artifacts if available
-        run_dir_str = os.environ.get("LOOPBENCH_RUN_DIR", "")
+        run_dir_str = os.environ.get("LB_RUN_DIR", "")
         if run_dir_str:
             run_reports = Path(run_dir_str) / "ambiguity_reports"
             run_reports.mkdir(parents=True, exist_ok=True)

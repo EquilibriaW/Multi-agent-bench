@@ -101,6 +101,7 @@ class DeterministicHarness(MultiAgentHarness):
         self.event_logger = event_logger
         self.reflection_enabled = reflection_enabled
         self._tools: ToolRouter | None = None
+        self._emitted_conv_files: set = set()
 
         self.planner = self._pick_planner(role_paths)
         self.coders = [r for r in role_paths if r != self.planner]
@@ -1787,6 +1788,10 @@ class DeterministicHarness(MultiAgentHarness):
             conv_files = sorted(rt_dir.glob(pattern))
 
         for conv_path in conv_files:
+            # Skip files already emitted in a prior invocation for this run
+            if conv_path in self._emitted_conv_files:
+                continue
+            self._emitted_conv_files.add(conv_path)
             try:
                 conv = json.loads(conv_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
