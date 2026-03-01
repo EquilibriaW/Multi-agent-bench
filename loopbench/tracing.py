@@ -613,7 +613,7 @@ def _extract_role_phase_usage(payload: Any) -> Optional[Dict[str, Any]]:
     model_name = model if isinstance(model, str) and model.strip() else "unknown"
     attempt_count = _read_non_negative_int(output.get("openrouter_attempt_count"))
     raw_chars = _read_non_negative_int(output.get("openrouter_raw_chars"))
-    structured_valid = bool(output.get("openrouter_structured_valid"))
+    structured_valid = bool(output.get("openrouter_structured_valid", True))
 
     return {
         "role": role,

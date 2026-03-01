@@ -115,14 +115,14 @@ def extract_tool_usage_from_conversation(conv: dict) -> dict:
             if name in ("write_file", "create_file"):
                 write_count += 1
 
-            # Check for anti-patterns in execute calls
-            if name == "execute":
+            # Check for anti-patterns in execute/exec calls
+            if name in ("execute", "exec"):
                 args_str = func.get("arguments", "{}")
                 try:
                     args = json.loads(args_str) if isinstance(args_str, str) else args_str
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                label = classify_anti_pattern("execute", args)
+                label = classify_anti_pattern(name, args)
                 if label:
                     cmd = args.get("command", "")
                     if isinstance(cmd, str):
@@ -192,12 +192,12 @@ _EXEC_ANTI_PATTERNS: list[tuple[str, list[str]]] = [
 
 
 def classify_anti_pattern(tool_name: str, args: dict) -> str | None:
-    """Return anti-pattern label if exec_command duplicates a dedicated tool.
+    """Return anti-pattern label if exec/execute duplicates a dedicated tool.
 
-    E.g. execute('find ...') -> 'find_via_exec', execute('cat ...') -> 'cat_via_exec'
+    E.g. exec('find ...') -> 'find_via_exec', exec('cat ...') -> 'cat_via_exec'
     Returns None if not an anti-pattern.
     """
-    if tool_name != "execute":
+    if tool_name not in ("execute", "exec"):
         return None
 
     command = args.get("command", "")
