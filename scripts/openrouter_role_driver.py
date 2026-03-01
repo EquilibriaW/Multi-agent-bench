@@ -1036,7 +1036,7 @@ def _build_system_prompt(*, role: str, phase: str, context: Dict[str, Any]) -> s
     return base
 
 
-def _collect_repo_context(*, worktree: Path, _context: Dict[str, Any]) -> Dict[str, Any]:
+def _collect_repo_context(*, worktree: Path, context: Dict[str, Any]) -> Dict[str, Any]:
     task_readme = _safe_read_text(worktree / "public" / "README.task.md", max_chars=8000)
     if task_readme is None:
         task_readme = _safe_read_text(worktree / ".loopbench" / "public" / "README.task.md", max_chars=8000)
@@ -1458,14 +1458,17 @@ def _execute_tool_inner(
         reports_dir.mkdir(parents=True, exist_ok=True)
         report_file = reports_dir / f"{int(_time_mod.time() * 1000)}.json"
         report_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        # Also write to run artifacts if available
+        # Best-effort mirror to run artifacts (may be unreachable in sandboxed envs)
         run_dir_str = os.environ.get("LB_RUN_DIR", "")
         if run_dir_str:
-            run_reports = Path(run_dir_str) / "ambiguity_reports"
-            run_reports.mkdir(parents=True, exist_ok=True)
-            (run_reports / report_file.name).write_text(
-                json.dumps(report, indent=2), encoding="utf-8"
-            )
+            try:
+                run_reports = Path(run_dir_str) / "ambiguity_reports"
+                run_reports.mkdir(parents=True, exist_ok=True)
+                (run_reports / report_file.name).write_text(
+                    json.dumps(report, indent=2), encoding="utf-8"
+                )
+            except OSError:
+                pass  # host path not mounted in sandbox
         return f"Ambiguity reported: [{category}] {description[:100]}"
 
     policy = _get_command_policy()

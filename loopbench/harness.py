@@ -1788,10 +1788,16 @@ class DeterministicHarness(MultiAgentHarness):
             conv_files = sorted(rt_dir.glob(pattern))
 
         for conv_path in conv_files:
-            # Skip files already emitted in a prior invocation for this run
-            if conv_path in self._emitted_conv_files:
+            # Dedupe by (path, mtime) so a rewritten file (e.g. re-bootstrap
+            # overwriting the same filename) is re-processed.
+            try:
+                mtime = conv_path.stat().st_mtime_ns
+            except OSError:
                 continue
-            self._emitted_conv_files.add(conv_path)
+            key = (conv_path, mtime)
+            if key in self._emitted_conv_files:
+                continue
+            self._emitted_conv_files.add(key)
             try:
                 conv = json.loads(conv_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
