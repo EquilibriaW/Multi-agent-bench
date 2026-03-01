@@ -122,6 +122,8 @@ def extract_tool_usage_from_conversation(conv: dict) -> dict:
                     args = json.loads(args_str) if isinstance(args_str, str) else args_str
                 except (json.JSONDecodeError, TypeError):
                     args = {}
+                if not isinstance(args, dict):
+                    args = {}
                 label = classify_anti_pattern(name, args)
                 if label:
                     cmd = args.get("command", "")
