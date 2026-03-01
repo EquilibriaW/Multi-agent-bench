@@ -112,7 +112,7 @@ def extract_tool_usage_from_conversation(conv: dict) -> dict:
             name = func.get("name", "unknown")
             tool_dist[name] = tool_dist.get(name, 0) + 1
 
-            if name in ("write_file", "create_file"):
+            if name in ("write_file", "create_file", "apply_patch"):
                 write_count += 1
 
             # Check for anti-patterns in execute/exec calls

@@ -605,7 +605,7 @@ def main() -> int:
             "or set OPENROUTER_API_KEY_ENV to the env-var name."
         )
 
-    repo_ctx = _collect_repo_context(worktree=worktree, context=context)
+    repo_ctx = _collect_repo_context(worktree=worktree)
     payload = _build_payload(
         role=role,
         phase=phase,
@@ -1036,7 +1036,7 @@ def _build_system_prompt(*, role: str, phase: str, context: Dict[str, Any]) -> s
     return base
 
 
-def _collect_repo_context(*, worktree: Path, context: Dict[str, Any]) -> Dict[str, Any]:
+def _collect_repo_context(*, worktree: Path) -> Dict[str, Any]:
     task_readme = _safe_read_text(worktree / "public" / "README.task.md", max_chars=8000)
     if task_readme is None:
         task_readme = _safe_read_text(worktree / ".loopbench" / "public" / "README.task.md", max_chars=8000)

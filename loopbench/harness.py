@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1737,6 +1738,9 @@ class DeterministicHarness(MultiAgentHarness):
                 # Emit driver_tool events from the conversation artifact so the
                 # canonical event stream reflects the agent's actual action space.
                 self._emit_driver_tool_events(role=role, phase=phase, span_id=span_id)
+                # Collect ambiguity reports from worktree (driver may not be
+                # able to write to run_dir in sandboxed environments).
+                self._collect_ambiguity_reports(role=role)
             else:
                 result.output = self._materialize_role_actions(
                     role=role,
@@ -1849,6 +1853,27 @@ class DeterministicHarness(MultiAgentHarness):
                         },
                         span_id=span_id,
                     )
+
+    def _collect_ambiguity_reports(self, *, role: str) -> None:
+        """Copy ambiguity reports from worktree into run artifacts.
+
+        The driver writes reports to .loopbench/ambiguity_reports/ inside the
+        worktree.  In sandboxed environments the driver cannot write directly
+        to run_dir, so the harness collects them after the phase completes.
+        """
+        worktree = self.role_paths.get(role)
+        if not worktree:
+            return
+        src_dir = worktree / ".loopbench" / "ambiguity_reports"
+        if not src_dir.is_dir():
+            return
+        dst_dir = self.run_dir / "ambiguity_reports"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for src in src_dir.iterdir():
+            if src.is_file() and src.suffix == ".json":
+                dst = dst_dir / src.name
+                if not dst.exists():
+                    shutil.copy2(src, dst)
 
     def _role_failure_message(self, *, role: str, phase: str, result: RoleRunResult) -> str:
         output_error = result.output.get("error") if isinstance(result.output, dict) else None
